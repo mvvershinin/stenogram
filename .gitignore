@@ -1,0 +1,50 @@
+# Окружение — разворачивается через ./setup.sh, весит больше гигабайта
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Модели — скачиваются при установке, в репозитории им не место
+models/
+*.onnx
+*.bin
+*.ct2
+*.tar.bz2
+
+# Исходные записи: могут содержать персональные данные и весят сотни мегабайт
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.webm
+*.mp3
+*.m4a
+*.wav
+*.ogg
+*.flac
+*.opus
+
+# Результаты обработки
+*.srt
+*.vtt
+/out/
+/output/
+/результаты/
+/заседание_*/
+
+# ОС и редакторы
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~

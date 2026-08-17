@@ -1,0 +1,5 @@
+faster-whisper>=1.1.0
+sherpa-onnx>=1.10.0
+scikit-learn>=1.4
+numpy>=1.24
+static-ffmpeg>=2.5   # не нужен, если ffmpeg установлен в системе
