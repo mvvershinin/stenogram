@@ -48,3 +48,6 @@ Thumbs.db
 .vscode/
 *.swp
 *~
+
+# Локальные настройки Claude Code (разрешения конкретной машины)
+.claude/settings.local.json
