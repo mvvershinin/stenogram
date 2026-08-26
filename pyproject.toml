@@ -1,0 +1,101 @@
+[build-system]
+# >=77: ниже этой версии setuptools не принимает строковую форму `license = "MIT"`
+# (PEP 639) — падает на валидации `project.license` при разборе pyproject.toml
+# («project.license must be valid exactly by one definition»). Проверено эмпирически
+# на реальных версиях (68.1.2 и 71.1.0 — ValueError, 79.0.1 и 83.0.0 — успех,
+# метаданные с `License-Expression: MIT`, `Metadata-Version: 2.4`). Обычная установка
+# это не ловит, потому что изоляция сборки pip сама подтягивает свежий setuptools —
+# граница важна для `--no-build-isolation` и офлайн-wheelhouse (см. docs/эксплуатация.md).
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stenogram"
+dynamic = ["version"]
+description = "Офлайн стенограмма видеоконференции: распознавание речи с разбивкой по участникам"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+
+dependencies = [
+    "faster-whisper>=1.1.0,<2",
+    "sherpa-onnx>=1.10.0,<2",
+    "scikit-learn>=1.4,<2",
+    "numpy>=1.24,<3",
+    "static-ffmpeg>=2.5,<4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.6,<0.16",  # верхняя граница: новый минор ruff может добавить правило и покрасить CI без правок кода
+    "pytest>=8",
+    "build",
+]
+
+[project.scripts]
+stenogram = "stenogram.cli:main"
+
+[tool.setuptools]
+packages = ["stenogram"]
+
+[tool.setuptools.dynamic]
+version = { attr = "stenogram.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Опечатка вида @pytest.mark.ffmepg иначе тихо отключает автоскип из conftest.py —
+# тест просто покраснеет на машине без ffmpeg вместо ожидаемого skip.
+addopts = ["--strict-markers"]
+markers = [
+    "ffmpeg: нужен бинарник ffmpeg, но быстро — секунды",
+    "slow: ONNX-модели или faster-whisper, сеть, минуты",
+]
+
+[tool.ruff]
+target-version = "py310"
+# Не Black-умолчание 88: фактический максимум строки в stenogram/*.py — 177 символов,
+# в основном из-за содержательных русскоязычных docstring'ов и комментариев
+# (объяснения "почему", а не только "что" — стиль проекта, см. CLAUDE.md/decisions).
+# ruff format такие строки не переносит — это обычный текст, а не код. 180 — с небольшим
+# запасом над наблюдаемым максимумом, чтобы не перекраивать уже вычитанный текст ради
+# самой цифры.
+line-length = 180
+
+[tool.ruff.lint]
+select = [
+    "E",        # pycodestyle: ошибки
+    "F",        # pyflakes
+    "W",        # pycodestyle: предупреждения
+    "I",        # isort: порядок импортов
+    "UP",       # pyupgrade: современный синтаксис под целевую py310
+    "B",        # flake8-bugbear: типичные баги
+    "A",        # flake8-builtins: не затенять встроенные имена
+    "SIM",      # flake8-simplify: упрощения, не меняющие поведение
+    "RUF",      # правила самого ruff
+    "PLC0415",  # import-outside-top-level — точечно, а не весь Pylint. Это страж
+    # правила "тяжёлые импорты только внутри функций" (faster_whisper, sherpa_onnx,
+    # sklearn — см. .docs/decisions/0004-без-pytorch.md и docs/архитектура.md):
+    # если правило когда-нибудь предложит вынести один из них на уровень модуля —
+    # это не ложное срабатывание, а реальный регресс автозагрузки при `--help`.
+    # Сами тяжёлые импорты помечены точечно `# noqa: PLC0415` прямо в коде.
+    "S310",     # suspicious-url-open-usage — тоже точечно, а не весь flake8-bandit.
+    # Единственный urlopen (models.py, скачивание моделей с GitHub Releases) уже был
+    # заранее помечен `# noqa: S310` до появления этого файла. Остальной "S" не
+    # включаем: subprocess.run на каждый вызов ffmpeg потребовал бы точечных
+    # подавлений без реальной пользы для этого проекта.
+]
+# ARG (flake8-unused-arguments) сознательно не включаем даже точечно: единственная
+# причина рассмотреть его — сигнатуры хуков pytest в tests/conftest.py, у которых
+# по контракту хука используются не все параметры, но включение тут же ловит и
+# обычные заглушки моков вида `def boom(*args, **kwargs)` в tests/test_cli.py —
+# то есть решение не точечное, а открывает целую категорию для директории, которую
+# пишет параллельный агент и которая ещё меняется прямо сейчас. Оставляю выбор
+# test-expert'у/координатору.
+ignore = [
+    "RUF001",  # ambiguous-unicode-character-string
+    "RUF002",  # ambiguous-unicode-character-docstring
+    "RUF003",  # ambiguous-unicode-character-comment
+    # Проект русскоязычный: кириллица массово "confusable" с латиницей
+    # (а/a, е/e, о/o, р/p, с/c, х/x, В/B, Н/H, …) — без этого правило находит
+    # "проблему" почти в каждом комментарии и docstring.
+]

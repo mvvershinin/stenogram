@@ -1,0 +1,254 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Без этого шаги идут под `bash -e` — errexit есть, pipefail нет, и в любом конвейере
+# `a | b` падение `a` теряется: шаг зелёный по коду `b`. Явный `shell: bash` включает
+# `-eo pipefail` и закрывает эту категорию ложных зелёностей разом, а не по одному
+# конвейеру. Заодно фиксирует одинаковое поведение на ubuntu и macOS.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Линт: ruff check + ruff format --check. Без зависимостей проекта (faster-whisper,
+  # sherpa-onnx и т.д.) — только сам ruff, поэтому джоба лёгкая и быстрая.
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Установить ruff (без зависимостей проекта)
+        run: python -m pip install --upgrade "ruff>=0.6,<0.16"
+
+      - name: ruff check
+        run: ruff check .
+
+      - name: ruff format --check
+        run: ruff format --check .
+
+  # Тесты: pytest -m "not slow" на матрице Python. Распознавание в CI не гоняем —
+  # ни моделей, ни записей здесь нет и не будет; "slow"-тесты (ONNX/faster-whisper,
+  # сеть) исключены маркером.
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Установить ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          # Тесты с маркером «ffmpeg» при отсутствии бинарника не краснеют, а молча
+          # пропускаются (tests/conftest.py, автоскип). Это правильно на машине
+          # разработчика и недопустимо здесь: джоба стала бы зелёной за тесты,
+          # которые не выполнялись. Поэтому наличие проверяется явным прогоном.
+          for bin in ffmpeg ffprobe; do
+            if ! "$bin" -version >/dev/null 2>&1; then
+              echo "::error::$bin недоступен после apt-get. Тесты с маркером «ffmpeg» молча пропустились бы, и джоба была бы зелёной, ничего не проверив."
+              exit 1
+            fi
+          done
+          echo "OK: ffmpeg и ffprobe на месте — автоскип маркера «ffmpeg» не сработает"
+
+      - name: Установить пакет с dev-зависимостями
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Тесты (pytest -m "not slow")
+        run: |
+          # Условие честности: пустой набор тестов даёт код 5 ("no tests collected").
+          # Джоба обязана остаться красной в этом случае, а не превратиться в зелёный
+          # бейдж, как будто что-то было проверено, — поэтому код 5 отдельно распознаётся
+          # и явно объясняется, а не проглатывается.
+          code=0
+          pytest -m "not slow" || code=$?
+          if [ "$code" -eq 5 ]; then
+            echo "::error::pytest вернул код 5 — «no tests collected»: в tests/ ещё нет ни одного теста (раздел 5 плана публикации, .docs/plans/2026-08-25_публикация.md). Джоба намеренно красная: зелёный бейдж на пустом наборе тестов лгал бы сильнее, чем его отсутствие."
+          fi
+          exit "$code"
+
+  # Дымовой тест установки: единственная проверка, что дерево зависимостей резолвится
+  # сегодняшними границами версий из pyproject.toml, плюс регресс-тест на отложенные
+  # тяжёлые импорты (--help обязан отработать за доли секунды). Моделей и записей нет —
+  # распознавание здесь не запускается.
+  install-smoke:
+    name: install-smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: "pip install . (реальная установка, без --no-deps)"
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+
+      - name: torch-guard (решение 0004 — PyTorch не должен прийти транзитивно)
+        run: |
+          # Проверяется импортируемость, а не запись в реестре пакетов. `pip show torch`
+          # спрашивал метаданные и молча зависел от кода возврата pip; find_spec отвечает
+          # на настоящий вопрос решения 0004 — «есть ли torch в окружении» — и находит
+          # его даже приехавшим внутри чужого колеса без собственной dist-info.
+          # Импорт при этом не выполняется: сам `import torch` — секунды.
+          if python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('torch') else 1)"; then
+            echo "::error::PyTorch найден в окружении — нарушено .docs/decisions/0004-без-pytorch.md. Обычная причина: кто-то запросил extra вида faster-whisper[conversion] или huggingface-hub[torch]."
+            pip list 2>/dev/null | grep -i -E "torch|nvidia" || true
+            exit 1
+          fi
+          echo "OK: PyTorch в окружении нет"
+
+      - name: "Отложенные импорты: --help не должен тянуть тяжёлые библиотеки"
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          cat > "${RUNNER_TEMP}/deferred_imports_guard.py" <<'PY'
+          """Сторож правила «тяжёлые импорты только внутри функций».
+
+          CLAUDE.md, docs/архитектура.md, .docs/decisions/0004-без-pytorch.md: faster_whisper,
+          sherpa_onnx и sklearn грузятся внутри функций, иначе `--help` ждёт ONNX Runtime.
+
+          Две проверки, потому что одной мало.
+
+          1. СОСТАВ. После `--help` в sys.modules не должно быть ни одной запрещённой
+             библиотеки. Проверка точная и от скорости машины не зависит. Она ловит и тот
+             регресс, который часами не поймает: `import sherpa_onnx` стоит 0.01-0.03 с
+             (ONNX Runtime грузится лениво, при создании модели), то есть утечка sherpa_onnx
+             на уровень модуля вообще не видна на секундомере.
+
+          2. ВРЕМЯ. Грубая сеть на то, чего нет в списке имён: новая тяжёлая зависимость,
+             разбухший numpy, чтение чего-то с диска при старте.
+          """
+
+          import contextlib
+          import io
+          import subprocess
+          import sys
+          import time
+
+          # Полный список запрещённого: три библиотеки из правила плюс их тяжёлые рантаймы,
+          # которые в стек-трейсе импорта окажутся раньше самой библиотеки.
+          FORBIDDEN = {
+              "faster_whisper",
+              "ctranslate2",
+              "sherpa_onnx",
+              "onnxruntime",
+              "sklearn",
+              "scipy",
+              "torch",
+          }
+
+          RUNS = 5
+          # Порог 0.60 с. Норма 0.11-0.20 с, на загруженной машине единичный прогон доходил
+          # до 0.50 с, а минимум из пяти оставался 0.133 с. Самый дешёвый регресс, который
+          # вообще видно по времени, — sklearn на уровне модуля: 0.86-0.90 с на быстрой
+          # машине, ~1.4 с по замеру ревьюера. Полный регресс — 1.85 с. 0.60 стоит между:
+          # втрое выше худшей нормы и в полтора раза ниже самого дешёвого видимого регресса.
+          # Точность обеспечивает проверка 1, а не это число, поэтому запас взят в сторону
+          # «не краснеть от дрожания раннера»: мигающий CI обесценивает бейдж быстрее,
+          # чем отсутствующий.
+          THRESHOLD = 0.60
+
+          problems: list[str] = []
+
+          # --- Проверка 1: что вообще загрузилось --------------------------------------
+          # Файл лежит вне дерева проекта, поэтому `stenogram` берётся из site-packages —
+          # проверяется установленный пакет, а не исходники рядом с чекаутом.
+          from stenogram.cli import main  # noqa: E402 -- намеренно после настройки
+
+          with contextlib.suppress(SystemExit), contextlib.redirect_stdout(io.StringIO()):
+              main(["--help"])
+
+          roots = {name.partition(".")[0] for name in sys.modules}
+          leaked = sorted(roots & FORBIDDEN)
+          third_party = sorted(n for n in roots if n and not n.startswith("_") and n != "stenogram" and n not in sys.stdlib_module_names)
+
+          print("сторонние модули после --help:", ", ".join(third_party) or "нет")
+
+          if leaked:
+              problems.append(
+                  f"::error::При `--help` загрузились тяжёлые библиотеки: {', '.join(leaked)}. "
+                  "Импорт утёк на уровень модуля — правило «тяжёлые импорты только внутри функций» "
+                  "нарушено (CLAUDE.md, docs/архитектура.md, .docs/decisions/0004-без-pytorch.md)."
+              )
+          else:
+              print(f"OK: ни одной из {len(FORBIDDEN)} запрещённых библиотек при --help не загружено")
+
+          # --- Проверка 2: сколько это заняло ------------------------------------------
+          # Меряем именно console script, как его видит пользователь. Берём минимум из RUNS:
+          # минимум наименее чувствителен к дрожанию раннера, а регресс тормозит все прогоны
+          # без исключения, включая самый быстрый.
+          times: list[float] = []
+          for attempt in range(1, RUNS + 1):
+              started = time.perf_counter()
+              done = subprocess.run(["stenogram", "--help"], capture_output=True, text=True, check=False)
+              elapsed = time.perf_counter() - started
+              if done.returncode != 0:
+                  problems.append(f"::error::`stenogram --help` завершился кодом {done.returncode}, а не 0. stderr: {done.stderr.strip()[:400]}")
+                  break
+              if "usage:" not in done.stdout:
+                  problems.append(f"::error::`stenogram --help` отработал за {elapsed:.3f} с, но справку не напечатал — замер бессмысленен, console script сломан.")
+                  break
+              times.append(elapsed)
+              print(f"  прогон {attempt}/{RUNS}: {elapsed:.3f} с")
+
+          if times:
+              best = min(times)
+              print(f"лучший из {len(times)}: {best:.3f} с · порог {THRESHOLD:.2f} с · норма ~0.11-0.20 с · регресс sklearn ~0.9-1.4 с")
+              if best > THRESHOLD:
+                  problems.append(
+                      f"::error::`stenogram --help` занял {best:.3f} с при пороге {THRESHOLD:.2f} с. "
+                      "Что-то тяжёлое грузится при разборе аргументов. Найти виновника: "
+                      "`python -X importtime -c 'import stenogram.cli' 2>&1 | sort -k2 -n -r | head -20`."
+                  )
+
+          for line in problems:
+              print(line)
+          sys.exit(1 if problems else 0)
+          PY
+          # Запуск ИЗ RUNNER_TEMP, а не из чекаута: иначе `import stenogram` подхватил бы
+          # исходники рядом с ci.yml, а не то, что реально поставил `pip install .`.
+          cd "${RUNNER_TEMP}"
+          python deferred_imports_guard.py
