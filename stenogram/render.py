@@ -1,4 +1,5 @@
 """Форматы выгрузки стенограммы."""
+
 from __future__ import annotations
 
 import json
@@ -22,8 +23,7 @@ def speaker_name(index: int, names: dict[int, str] | None) -> str:
     return f"Говорящий {index + 1}"
 
 
-def to_text(utterances: list[Utterance], names: dict[int, str] | None = None,
-            timestamps: bool = True) -> str:
+def to_text(utterances: list[Utterance], names: dict[int, str] | None = None, timestamps: bool = True) -> str:
     lines = []
     for utterance in utterances:
         stamp = f"[{hhmmss(utterance.start)}] " if timestamps else ""
@@ -31,41 +31,33 @@ def to_text(utterances: list[Utterance], names: dict[int, str] | None = None,
     return "\n\n".join(lines) + "\n"
 
 
-def to_markdown(utterances: list[Utterance], names: dict[int, str] | None = None,
-                title: str = "Стенограмма", meta: dict | None = None) -> str:
+def to_markdown(utterances: list[Utterance], names: dict[int, str] | None = None, title: str = "Стенограмма", meta: dict | None = None) -> str:
     out = [f"# {title}", ""]
     if meta:
         out += [f"- **{k}:** {v}" for k, v in meta.items()] + [""]
 
     stats = speaker_stats(utterances)
-    out += ["## Участники", "",
-            "| Участник | Время | Доля | Реплик | Слов |",
-            "|---|---:|---:|---:|---:|"]
+    out += ["## Участники", "", "| Участник | Время | Доля | Реплик | Слов |", "|---|---:|---:|---:|---:|"]
     for index, entry in stats.items():
-        out.append(f"| {speaker_name(index, names)} | {entry['seconds']/60:.1f} мин "
-                   f"| {entry['share']:.0%} | {entry['turns']} | {entry['words']} |")
+        out.append(f"| {speaker_name(index, names)} | {entry['seconds'] / 60:.1f} мин | {entry['share']:.0%} | {entry['turns']} | {entry['words']} |")
 
     out += ["", "## Диалог", ""]
     for utterance in utterances:
-        out.append(f"**{speaker_name(utterance.speaker, names)}** "
-                   f"`{hhmmss(utterance.start)}`  \n{utterance.text}")
+        out.append(f"**{speaker_name(utterance.speaker, names)}** `{hhmmss(utterance.start)}`  \n{utterance.text}")
         out.append("")
     return "\n".join(out)
 
 
-def to_srt(utterances: list[Utterance], names: dict[int, str] | None = None,
-           max_chars: int = 90) -> str:
+def to_srt(utterances: list[Utterance], names: dict[int, str] | None = None, max_chars: int = 90) -> str:
     blocks, index = [], 1
     for utterance in utterances:
         for start, end, text in _split(utterance, max_chars):
-            blocks.append(f"{index}\n{hhmmss(start, True, True)} --> {hhmmss(end, True, True)}\n"
-                          f"{speaker_name(utterance.speaker, names)}: {text}\n")
+            blocks.append(f"{index}\n{hhmmss(start, True, True)} --> {hhmmss(end, True, True)}\n{speaker_name(utterance.speaker, names)}: {text}\n")
             index += 1
     return "\n".join(blocks)
 
 
-def to_vtt(utterances: list[Utterance], names: dict[int, str] | None = None,
-           max_chars: int = 90) -> str:
+def to_vtt(utterances: list[Utterance], names: dict[int, str] | None = None, max_chars: int = 90) -> str:
     blocks = ["WEBVTT", ""]
     for utterance in utterances:
         for start, end, text in _split(utterance, max_chars):
@@ -90,21 +82,18 @@ def _split(utterance: Utterance, max_chars: int):
         yield start, buffer[-1].end, "".join(w.text for w in buffer).strip()
 
 
-def to_json(utterances: list[Utterance], names: dict[int, str] | None = None,
-            meta: dict | None = None) -> str:
+def to_json(utterances: list[Utterance], names: dict[int, str] | None = None, meta: dict | None = None) -> str:
     payload = {
         "meta": meta or {},
-        "speakers": [
-            {"id": index, "name": speaker_name(index, names), **entry}
-            for index, entry in speaker_stats(utterances).items()
-        ],
+        "speakers": [{"id": index, "name": speaker_name(index, names), **entry} for index, entry in speaker_stats(utterances).items()],
         "utterances": [
             {
-                "start": round(u.start, 2), "end": round(u.end, 2),
-                "speaker_id": u.speaker, "speaker": speaker_name(u.speaker, names),
+                "start": round(u.start, 2),
+                "end": round(u.end, 2),
+                "speaker_id": u.speaker,
+                "speaker": speaker_name(u.speaker, names),
                 "text": u.text,
-                "words": [{"start": round(w.start, 2), "end": round(w.end, 2),
-                           "word": w.text.strip()} for w in u.words],
+                "words": [{"start": round(w.start, 2), "end": round(w.end, 2), "word": w.text.strip()} for w in u.words],
             }
             for u in utterances
         ],
@@ -121,8 +110,7 @@ WRITERS = {
 }
 
 
-def write(utterances: list[Utterance], stem: Path, formats: list[str],
-          names: dict[int, str] | None = None, meta: dict | None = None) -> list[Path]:
+def write(utterances: list[Utterance], stem: Path, formats: list[str], names: dict[int, str] | None = None, meta: dict | None = None) -> list[Path]:
     written = []
     for fmt in formats:
         if fmt not in WRITERS:

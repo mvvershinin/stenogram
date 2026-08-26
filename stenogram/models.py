@@ -1,4 +1,5 @@
 """Загрузка и кэширование ONNX-моделей для диаризации."""
+
 from __future__ import annotations
 
 import os

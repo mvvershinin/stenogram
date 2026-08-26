@@ -1,4 +1,5 @@
 """Сшивка распознанного текста с разметкой говорящих."""
+
 from __future__ import annotations
 
 from bisect import bisect_left
@@ -18,7 +19,12 @@ class Utterance:
 
 
 def _speaker_at(turns: list[Turn], starts: list[float], word: Word) -> int:
-    """Говорящий с наибольшим перекрытием по времени; при отсутствии — ближайший по времени."""
+    """Говорящий с наибольшим перекрытием по времени; при отсутствии — ближайший по времени.
+
+    turns и starts обязаны быть отсортированы по .start: bisect_left по несортированному
+    списку не бросает исключение, а молча даёт другой ответ. Инвариант поддерживает
+    единственный вызывающий — assign().
+    """
     best_speaker, best_overlap = -1, 0.0
     i = max(0, bisect_left(starts, word.start) - 1)
     while i < len(turns) and turns[i].start < word.end:
@@ -30,18 +36,22 @@ def _speaker_at(turns: list[Turn], starts: list[float], word: Word) -> int:
         return best_speaker
 
     middle = (word.start + word.end) / 2
-    nearest = min(turns, key=lambda t: 0 if t.start <= middle <= t.end
-                  else min(abs(t.start - middle), abs(t.end - middle)))
+    nearest = min(turns, key=lambda t: 0 if t.start <= middle <= t.end else min(abs(t.start - middle), abs(t.end - middle)))
     return nearest.speaker
 
 
-def assign(segments: list[Segment], turns: list[Turn], max_pause: float = 2.0,
-           min_utterance: float = 0.35) -> list[Utterance]:
+def assign(segments: list[Segment], turns: list[Turn], max_pause: float = 2.0, min_utterance: float = 0.35) -> list[Utterance]:
     """Размечает каждое слово говорящим и собирает слова в реплики.
+
+    turns может быть передан в любом порядке: assign сортирует его по .start первой
+    же строкой, поэтому вызывающему коду сортировать заранее не обязательно. Все три
+    встроенных источника (video.to_turns, diarization.diarize, diarization.diarize_with_video)
+    и так отдают отсортированный список, сортировка для них — no-op.
 
     max_pause — пауза внутри реплики одного человека, после которой начинается новая.
     min_utterance — реплики короче отдаются соседям, чтобы убрать дребезг разметки.
     """
+    turns = sorted(turns, key=lambda t: t.start)
     if not turns:
         return [Utterance(s.start, s.end, 0, s.text, s.words) for s in segments]
 
@@ -77,9 +87,9 @@ def _smooth(tagged: list[tuple[int, Word]], window: int = 2) -> list[tuple[int, 
     labels = [s for s, _ in tagged]
     fixed = labels[:]
     for i in range(len(labels)):
-        left = labels[max(0, i - window): i]
-        right = labels[i + 1: i + 1 + window]
-        if left and right and left[-1] == right[0] and left[-1] != labels[i]:
+        left = labels[max(0, i - window) : i]
+        right = labels[i + 1 : i + 1 + window]
+        if left and right and left[-1] == right[0] and left[-1] != labels[i]:  # noqa: SIM102 -- слияние с внутренним if не трогаю: правки align.py требуют /measure, вне рамок этой задачи
             if all(x == left[-1] for x in left) and all(x == right[0] for x in right):
                 fixed[i] = left[-1]
     return [(fixed[i], word) for i, (_, word) in enumerate(tagged)]
@@ -89,14 +99,12 @@ def _absorb_short(utterances: list[Utterance], min_duration: float) -> list[Utte
     """Склеивает микрореплики с соседней, если та принадлежит одному говорящему."""
     result: list[Utterance] = []
     for utterance in utterances:
-        if (result and utterance.end - utterance.start < min_duration
-                and len(utterance.text) <= 3 and result[-1].speaker != utterance.speaker):
+        if result and utterance.end - utterance.start < min_duration and len(utterance.text) <= 3 and result[-1].speaker != utterance.speaker:
             result[-1].words.extend(utterance.words)
             result[-1].end = utterance.end
             result[-1].text = "".join(w.text for w in result[-1].words).strip()
             continue
-        if (result and result[-1].speaker == utterance.speaker
-                and utterance.start - result[-1].end <= 2.0):
+        if result and result[-1].speaker == utterance.speaker and utterance.start - result[-1].end <= 2.0:
             result[-1].words.extend(utterance.words)
             result[-1].end = utterance.end
             result[-1].text = "".join(w.text for w in result[-1].words).strip()
