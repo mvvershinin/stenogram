@@ -208,3 +208,25 @@ def test_concurrent_first_start_on_new_file(tmp_path):
     assert errors == []
     store = SqliteJobStore(Path(paths[0]))
     assert store.claim_next() is None  # таблица на месте
+
+
+def test_create_with_known_sha256(store):
+    """Перезапуск несёт хэш родителя: воркер сможет обойтись без скачивания."""
+    job = store.create("s3://b/1.mp4", {}, sha256="c" * 64)
+    assert store.get(job.id).sha256 == "c" * 64
+    assert store.claim_next().sha256 == "c" * 64
+
+
+def test_release_requeues_without_spending_an_attempt(store):
+    """Остановка воркера по SIGTERM — не сбой задачи: попытка не списывается."""
+    job = store.create("s3://b/1.mp4", {})
+    claimed = store.claim_next()
+    store.progress(job.id, claimed.lease, "asr", 0.5)
+
+    assert store.release(job.id, claimed.lease)
+
+    released = store.get(job.id)
+    assert (released.status, released.attempts, released.lease, released.stage, released.heartbeat_at) == (QUEUED, 0, None, None, None)
+    assert not store.release(job.id, claimed.lease)  # аренды больше нет
+    assert not store.progress(job.id, claimed.lease, "asr", 0.6)
+    assert store.claim_next().attempts == 1

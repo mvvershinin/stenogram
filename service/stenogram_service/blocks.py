@@ -42,3 +42,11 @@ def for_job(document: dict[str, Any], *, source_uri: str, names: dict[int, str] 
 
     `names` — по номеру участника с нуля, как `speaker_id` в блоках."""
     return {**document, "source_uri": source_uri, "speakers": {str(k): v for k, v in sorted((names or {}).items())}}
+
+
+def to_utterances(document: dict[str, Any]) -> list[Utterance]:
+    """Реплики обратно из документа — для текстовой стенограммы с именами задачи.
+
+    Стенограмма рендерится из блоков и при попадании в кэш, и без него: оба пути
+    дают один и тот же текст."""
+    return [Utterance(b["locator"]["start"], b["locator"]["end"], b["locator"]["speaker_id"], b["text"]) for b in document["blocks"]]

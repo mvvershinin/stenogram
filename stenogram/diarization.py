@@ -32,6 +32,12 @@ def _report(progress: bool | Callable[[str, float | None], None], message: str, 
         print(message, flush=True)
 
 
+class NoSpeech(RuntimeError):
+    """В записи нет ни одного отрезка речи, по которому можно снять отпечаток голоса
+    (тишина, музыка). Подкласс RuntimeError: вызывающий, ловивший RuntimeError, не
+    замечает разницы, а сервис отличает «речи нет» от сбоя."""
+
+
 @dataclass
 class Turn:
     start: float
@@ -92,7 +98,7 @@ def embed(audio: np.ndarray, turns: list[Turn], num_threads: int = 4) -> tuple[n
         kept.append(i)
 
     if not vectors:
-        raise RuntimeError("В записи не найдено речи достаточной длительности")
+        raise NoSpeech("В записи не найдено речи достаточной длительности")
 
     matrix = np.stack(vectors)
     matrix /= np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-9

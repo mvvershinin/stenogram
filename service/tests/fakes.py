@@ -19,6 +19,7 @@ class MemoryStorage(Storage):
         self.objects: dict[Location, bytes] = {}
         self.content_types: dict[Location, str] = {}
         self.writes: list[Location] = []
+        self.reads: list[Location] = []
         self.fail: dict[Location, StorageError] = {}
         self.chunk = chunk
 
@@ -27,6 +28,7 @@ class MemoryStorage(Storage):
             raise self.fail[loc]
 
     def iter_object(self, loc: Location) -> Iterator[bytes]:
+        self.reads.append(loc)
         self._check(loc)
         if loc not in self.objects:
             raise ObjectNotFound("объект не найден", "NoSuchKey")

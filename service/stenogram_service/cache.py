@@ -11,6 +11,7 @@
     <prefix>asr/<ключ распознавания>/audio16k.flac
     <prefix>asr/<ключ распознавания>/intermediate.json   — пишется последним: метка «запись целая»
     <prefix>result/<ключ результата>/transcript.txt
+    <prefix>result/<ключ результата>/meta.json           — сводка разметки для манифеста
     <prefix>result/<ключ результата>/blocks.json         — пишется последним
 
 Звук хранится во FLAC: без потерь и вдвое меньше WAV, а сжатие часа — секунды на фоне
@@ -197,6 +198,9 @@ class Cache:
     def text_location(self, reskey: str) -> Location:
         return self._loc("result", reskey, "transcript.txt")
 
+    def meta_location(self, reskey: str) -> Location:
+        return self._loc("result", reskey, "meta.json")
+
     def _read_json(self, loc: Location) -> Any | None:
         try:
             return self.storage.read_json(loc)
@@ -263,7 +267,11 @@ class Cache:
         except (ObjectNotFound, UnicodeDecodeError):
             return None
 
-    def put_result(self, reskey: str, document: dict[str, Any], text: str, *, video_error: str | None) -> bool:
+    def get_meta(self, reskey: str) -> dict[str, Any] | None:
+        """Сводка качества разметки при попадании в кэш результата (без неё `quality` пуст)."""
+        return self._read_json(self.meta_location(reskey))
+
+    def put_result(self, reskey: str, document: dict[str, Any], text: str, *, video_error: str | None, meta: dict[str, Any] | None = None) -> bool:
         """Кладёт результат; False — не положил.
 
         Документ должен быть обезличен: одинаковый файл под разными адресами и с разными
@@ -275,5 +283,7 @@ class Cache:
         if video_error is not None:
             return False
         self.storage.put_bytes(self.text_location(reskey), text.encode("utf-8"), "text/plain; charset=utf-8")
+        if meta is not None:
+            self.storage.put_json(self.meta_location(reskey), meta)
         self.storage.put_json(self.blocks_location(reskey), document)
         return True

@@ -22,6 +22,9 @@ _gaps_between, _merge_adjacent, _covered, ...) — в разделе «хоро�
 
 from __future__ import annotations
 
+import sys
+import types
+
 import numpy as np
 import pytest
 
@@ -337,3 +340,18 @@ def test_allocate_num_speakers_none_gives_one_per_tile():
     result = _allocate({0: 10.0, 1: 2.0}, [0, 1], num_speakers=None)
 
     assert result == {0: 1, 1: 1}
+
+
+def test_embed_without_speech_raises_no_speech_as_runtime_error(monkeypatch):
+    """Тишина или музыка: ни одной реплики длиннее порога отпечатка. Сервис отличает
+    это по классу (код no_speech), а для CLI и старых вызывающих это тот же RuntimeError
+    с тем же текстом."""
+    fake = types.SimpleNamespace(SpeakerEmbeddingExtractor=lambda config: object(), SpeakerEmbeddingExtractorConfig=lambda **kwargs: None)
+    monkeypatch.setitem(sys.modules, "sherpa_onnx", fake)
+    monkeypatch.setattr(diarization_module, "ensure_all", lambda: ("seg.onnx", "emb.onnx"))
+
+    with pytest.raises(diarization_module.NoSpeech) as err:
+        diarization_module.embed(np.zeros(16000, dtype=np.float32), [Turn(0.0, 0.1, 0), Turn(0.5, 0.7, 0)])
+
+    assert isinstance(err.value, RuntimeError)
+    assert str(err.value) == "В записи не найдено речи достаточной длительности"

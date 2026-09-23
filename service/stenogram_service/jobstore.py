@@ -58,7 +58,9 @@ class Recovered:
 
 class JobStore(ABC):
     @abstractmethod
-    def create(self, source_uri: str, params: dict[str, Any]) -> Job: ...
+    def create(self, source_uri: str, params: dict[str, Any], *, sha256: str | None = None) -> Job:
+        """`sha256` известен заранее у перезапуска: при попадании в кэш распознавания
+        исходник тогда не скачивается вовсе."""
 
     @abstractmethod
     def get(self, job_id: str) -> Job | None: ...
@@ -82,6 +84,11 @@ class JobStore(ABC):
 
     @abstractmethod
     def fail(self, job_id: str, lease: str, code: str, message: str) -> bool: ...
+
+    @abstractmethod
+    def release(self, job_id: str, lease: str) -> bool:
+        """Вернуть свою задачу в очередь без списания попытки — воркер останавливают
+        (SIGTERM), а задача здорова. Попытки тратит только пропавший воркер."""
 
     @abstractmethod
     def recover_stale(self, stale_after: float, max_attempts: int = 2) -> list[Recovered]:
@@ -186,13 +193,13 @@ class SqliteJobStore(JobStore):
             lease=lease,
         )
 
-    def create(self, source_uri: str, params: dict[str, Any]) -> Job:
+    def create(self, source_uri: str, params: dict[str, Any], *, sha256: str | None = None) -> Job:
         now = self.clock()
         job_id = str(uuid.uuid4())
         with self._connect() as db:
             db.execute(
-                "INSERT INTO jobs (id, status, params, source_uri, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (job_id, QUEUED, json.dumps(params, ensure_ascii=False, sort_keys=True), source_uri, now, now),
+                "INSERT INTO jobs (id, status, params, source_uri, sha256, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (job_id, QUEUED, json.dumps(params, ensure_ascii=False, sort_keys=True), source_uri, sha256, now, now),
             )
         job = self.get(job_id)
         assert job is not None
@@ -254,6 +261,14 @@ class SqliteJobStore(JobStore):
 
     def fail(self, job_id: str, lease: str, code: str, message: str) -> bool:
         return self._update_leased(job_id, lease, "status = ?, error_code = ?, error_message = ?, lease = NULL", (FAILED, code, message))
+
+    def release(self, job_id: str, lease: str) -> bool:
+        return self._update_leased(
+            job_id,
+            lease,
+            "status = ?, lease = NULL, stage = NULL, fraction = NULL, heartbeat_at = NULL, attempts = MAX(attempts - 1, 0)",
+            (QUEUED,),
+        )
 
     def recover_stale(self, stale_after: float, max_attempts: int = 2) -> list[Recovered]:
         now = self.clock()

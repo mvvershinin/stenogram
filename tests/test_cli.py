@@ -601,8 +601,10 @@ def test_main_creates_output_directory_before_pipeline_starts(tmp_path, monkeypa
         tarfile.ReadError("прокси отдал HTML вместо архива модели"),
         subprocess.CalledProcessError(1, ["ffmpeg"]),
         wave.Error("WAV повреждён или нечитаем"),
+        # Подкласс RuntimeError с прежним текстом: вывод CLI для тишины не изменился.
+        diarization.NoSpeech("В записи не найдено речи достаточной длительности"),
     ],
-    ids=["RuntimeError", "ValueError", "OSError", "URLError_subclass_of_OSError", "tarfile.TarError", "subprocess.SubprocessError", "wave.Error"],
+    ids=["RuntimeError", "ValueError", "OSError", "URLError_subclass_of_OSError", "tarfile.TarError", "subprocess.SubprocessError", "wave.Error", "diarization.NoSpeech"],
 )
 def test_main_generic_handler_catches_expected_exceptions_without_traceback(tmp_path, monkeypatch, capsys, exc):
     """Регресс: раньше перехватчик стоял только вокруг video.find_tiles,

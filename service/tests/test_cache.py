@@ -295,3 +295,14 @@ def test_corrupt_json_is_a_miss(tmp_path, storage, store, raw):
     assert store.get_intermediate("r1", tmp_path / "a.wav") is None
     assert store.get_result("k1") is None
     assert store.get_text("k1") is None
+
+
+def test_result_meta_is_written_before_blocks(storage, store):
+    doc = {"schema": blocks.SCHEMA, "doc_id": SHA, "source_uri": None, "speakers": {}, "blocks": []}
+    meta = {"speaker_source": "голос", "tiles": 0, "speakers": 1}
+
+    assert store.put_result("k1", doc, "", video_error=None, meta=meta)
+
+    assert storage.writes == [store.text_location("k1"), store.meta_location("k1"), store.blocks_location("k1")]
+    assert store.get_meta("k1") == meta
+    assert store.get_meta("нет") is None
