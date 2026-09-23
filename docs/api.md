@@ -4,8 +4,66 @@
 записи (float), индексы участников — с нуля.
 
 ```python
-from stenogram import align, asr, audio, diarization, models, render, video
+from stenogram import align, asr, audio, diarization, models, pipeline, render, video
 ```
+
+Параметр `progress` у функций: `True` — печатать ход работы, `False` — молчать, функция
+`(сообщение, доля пройденного или None)` — получать сообщения вместо печати.
+
+---
+
+## pipeline
+
+Весь пайплайн одной функцией, в том же порядке этапов, что у CLI. Встраивать stenogram
+в свой код стоит через неё, а не повторяя вызовы модулей: порядок этапов и умолчания
+стоят за замерами.
+
+### `run(source, wav, options=None, *, reuse=None, whisper_model=None, progress=None) -> Result`
+
+```python
+from stenogram import pipeline
+
+result = pipeline.run(Path("запись.mp4"), Path("/tmp/audio16k.wav"), pipeline.Options(language="ru", speakers=4))
+result.utterances     # list[Utterance] — то, что рендерится в файлы
+result.intermediate   # кэш для повторного прогона
+```
+
+Файлы не пишет: рендеры из `render` возвращают строки. `wav` — куда извлечь звук.
+Без `progress` молчит, с ним получает `Event(stage, message, fraction, error)` — те же
+строки, что печатает CLI; `stage` — `audio`, `video`, `asr`, `highlight` (метки подсветки),
+`diarization`, `align`. Исключения из `progress` всплывают наружу. `whisper_model` —
+модель от `asr.load_model`. Неверные `speakers`, `max_speakers`, `tile_speakers`
+(меньше 1) — `ValueError` до начала работы.
+
+**Повторный прогон с другими параметрами разметки** обходится без распознавания и без
+чтения видео — звук берётся из `wav` как есть:
+
+```python
+again = pipeline.run(None, wav, pipeline.Options(tile_speakers=[3, 1]), reuse=result.intermediate)
+```
+
+Если в кэше нет плиток (первый прогон шёл без видео), а разметка по видео нужна, нужен
+и `source`. Плитки в кэше используются, только если в этом прогоне включены и видео,
+и разметка; иначе они просто переходят в новый `intermediate`. Кэш распознавания
+вызывающий ключует сам: `run` не знает, с какой моделью и языком он получен. Поиск
+плиток, упавший в первом прогоне, повторяется, если передать копию кэша с `tiles=None`
+(`dataclasses.replace(result.intermediate, tiles=None)`). `TileSpeakersMismatch` (подкласс `ValueError`) — чисел в `tile_speakers`
+не столько, сколько плиток найдено; бросается до распознавания.
+
+### `Options` · `Result` · `Intermediate`
+
+`Options` — параметры с умолчаниями CLI: `model`, `language`, `prompt`, `beam_size`,
+`device`, `compute_type`, `threads` (0 — все ядра, кроме двух), `denoise`, `diarization`,
+`video`, `speakers`, `max_speakers`, `tile_speakers`, `highlight_lag`.
+
+`Result` — `utterances`, `turns`, `duration`, `intermediate`, `tile_counts` (сколько людей
+пришлось на плитку), `video_error` (поиск плиток упал — в этом прогоне или в кэше, — и
+нужная разметка по видео откатилась на голос), `video_used` (разметка в этом прогоне
+шла по видео).
+
+`Intermediate` — `segments`, `language`, `tiles` (`None` — не искали, `[]` — искали и не
+нашли), `labels` и `step` — метки подсветки, `video_error` — причина, если `tiles == []`
+из-за упавшего поиска.
 
 ---
 
@@ -61,7 +119,7 @@ class Tile:
 
 Ширина и высота кадра.
 
-### `find_tiles(path: Path, samples: int = 120, progress: bool = True) -> list[Tile]`
+### `find_tiles(path: Path, samples: int = 120, progress: bool | Callable = True) -> list[Tile]`
 
 Ищет плитки участников по мерцающей рамке подсветки. Пустой список означает, что
 подсветки нет — вызывающий код должен перейти на разметку по голосу.
@@ -69,7 +127,7 @@ class Tile:
 `samples` — сколько кадров анализировать. Больше кадров — устойчивее к записям, где
 кто-то говорит редко; дороже по времени.
 
-### `active_speaker(path, tiles, fps=5.0, progress=True) -> tuple[np.ndarray, float]`
+### `active_speaker(path, tiles, fps=5.0, progress: bool | Callable = True) -> tuple[np.ndarray, float]`
 
 Возвращает `(метки, шаг)`: массив индексов подсвеченной плитки по кадрам и шаг по времени
 в секундах. `-1` означает, что подсветки нет ни на одной плитке.
@@ -117,11 +175,22 @@ transcribe(
     device: str = "cpu",                # cpu | cuda | auto
     num_threads: int = 8,
     initial_prompt: str | None = None,  # тема, термины, фамилии
-    progress: bool = True,
+    progress: bool | Callable = True,
+    *,
+    model=None,                         # уже загруженная load_model модель
+    local_files_only: bool = False,
+    download_root: str | None = None,
 ) -> tuple[list[Segment], str]
 ```
 
-Возвращает сегменты с потайминговкой по словам и код определённого языка.
+Возвращает сегменты с потайминговкой по словам и код определённого языка. С `model`
+параметры загрузки не используются.
+
+### `load_model(model_name, device, compute_type, num_threads, local_files_only, download_root)`
+
+Загружает `WhisperModel`. Долгоживущий процесс держит одну модель и передаёт её в
+`transcribe(model=...)`. `local_files_only=True` делает отсутствие модели на диске ошибкой,
+а не походом в сеть.
 
 Внутри жёстко заданы `word_timestamps=True`, `condition_on_previous_text=False` и
 VAD-фильтр — эти значения не параметризованы намеренно, см. [алгоритмы](алгоритмы.md).
@@ -141,7 +210,7 @@ class Turn:
 
 Общий формат разметки участников. Его принимает `align.assign` независимо от источника.
 
-### `diarize(audio, num_speakers=None, max_speakers=12, num_threads=4, progress=True) -> list[Turn]`
+### `diarize(audio, num_speakers=None, max_speakers=12, num_threads=4, progress: bool | Callable = True) -> list[Turn]`
 
 Разметка только по звуку: сегментация → отпечатки → кластеризация → сглаживание.
 `num_speakers=None` включает автооценку по eigengap.
@@ -155,7 +224,7 @@ diarize_with_video(
     num_speakers: int | None = None,    # общее число участников
     tile_speakers: list[int] | None = None,   # по плиткам из find_tiles, например [3, 1]
     num_threads: int = 4,
-    progress: bool = True,
+    progress: bool | Callable = True,
 ) -> tuple[list[Turn], dict[int, int]]
 ```
 
@@ -229,7 +298,7 @@ class Utterance:
 Размечает каждое слово участником и собирает слова в реплики.
 
 - `max_pause` — пауза внутри реплики одного человека, после которой начинается новая.
-  CLI передаёт 3.0: на записях совещаний паузы длиннее.
+  `pipeline.run` передаёт 3.0 (`pipeline.MAX_PAUSE`): на записях совещаний паузы длиннее.
 - `min_utterance` — реплики короче отдаются соседям, чтобы убрать дребезг разметки.
 
 С пустым `turns` возвращает сегменты распознавания как есть, все с участником 0.
@@ -321,7 +390,7 @@ render.write(utterances, Path("совещание"), ["txt", "srt"],
 
 `"3,1"` → `[3, 1]`: по одному числу на каждую плитку из `find_tiles`, слева направо
 (см. [`diarize_with_video`](#по-каким-плиткам-нумеруются-числа)). Значения меньше 1
-отвергаются здесь же, на границе CLI. Длину список получает от `main()`: число плиток
+отвергаются здесь же, на границе CLI. Длину сверяет `pipeline.run`: число плиток
 известно только после шага `[2/4]`.
 
 ### `build_parser() -> argparse.ArgumentParser`
@@ -344,6 +413,8 @@ render.write(align.assign(segments, []), Path("лекция"), ["txt"])
 ```
 
 **Полный гибридный пайплайн**
+
+Так `pipeline.run` устроен внутри; в своём коде вызывайте его, а не повторяйте шаги.
 
 ```python
 from pathlib import Path

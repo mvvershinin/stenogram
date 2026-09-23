@@ -50,7 +50,7 @@ from urllib.error import URLError
 import numpy as np
 import pytest
 
-from stenogram import cli
+from stenogram import asr, audio, cli, diarization, video
 from stenogram.asr import Segment, Word
 from stenogram.render import WRITERS
 
@@ -97,7 +97,7 @@ def fake_pipeline(tmp_path, monkeypatch):
         def __init__(self):
             self.input = tmp_path / "запись.mp4"
             self.input.write_bytes(b"")
-            self.tiles = [cli.video.Tile(10, 0, 3, 20), cli.video.Tile(50, 0, 3, 20), cli.video.Tile(90, 0, 3, 20)]
+            self.tiles = [video.Tile(10, 0, 3, 20), video.Tile(50, 0, 3, 20), video.Tile(90, 0, 3, 20)]
             self.segments = _dense_speech_with_one_pause()
             self.video_turns: list = []
 
@@ -105,21 +105,21 @@ def fake_pipeline(tmp_path, monkeypatch):
             return cli.main([str(self.input), "-o", str(tmp_path / "вывод"), "-f", "txt", *extra])
 
     pipeline = Pipeline()
-    real_to_turns = cli.video.to_turns
+    real_to_turns = video.to_turns
 
     def recording_to_turns(*args, **kwargs):
         pipeline.video_turns = real_to_turns(*args, **kwargs)
         return pipeline.video_turns
 
-    monkeypatch.setattr(cli.audio, "extract_wav", lambda src, dst, denoise=False: dst)
-    monkeypatch.setattr(cli.audio, "probe_duration", lambda path: 20.0)
-    monkeypatch.setattr(cli.audio, "load_wav", lambda path: np.zeros(16000 * 20, dtype=np.float32))
-    monkeypatch.setattr(cli.video, "has_video", lambda path: True)
-    monkeypatch.setattr(cli.video, "find_tiles", lambda path: pipeline.tiles)
-    monkeypatch.setattr(cli.video, "active_speaker", lambda path, tiles, **kw: (_labels_three_tiles_short_middle(), _STEP))
-    monkeypatch.setattr(cli.video, "to_turns", recording_to_turns)
-    monkeypatch.setattr(cli.asr, "transcribe", lambda *a, **k: (pipeline.segments, "ru"))
-    monkeypatch.setattr(cli.diarization, "segment", lambda audio, num_threads=4, progress=True: [cli.diarization.Turn(i + 0.05, i + 0.95, 0) for i in range(20)])
+    monkeypatch.setattr(audio, "extract_wav", lambda src, dst, denoise=False: dst)
+    monkeypatch.setattr(audio, "probe_duration", lambda path: 20.0)
+    monkeypatch.setattr(audio, "load_wav", lambda path: np.zeros(16000 * 20, dtype=np.float32))
+    monkeypatch.setattr(video, "has_video", lambda path: True)
+    monkeypatch.setattr(video, "find_tiles", lambda path, **kw: pipeline.tiles)
+    monkeypatch.setattr(video, "active_speaker", lambda path, tiles, **kw: (_labels_three_tiles_short_middle(), _STEP))
+    monkeypatch.setattr(video, "to_turns", recording_to_turns)
+    monkeypatch.setattr(asr, "transcribe", lambda *a, **k: (pipeline.segments, "ru"))
+    monkeypatch.setattr(diarization, "segment", lambda audio, num_threads=4, progress=True: [diarization.Turn(i + 0.05, i + 0.95, 0) for i in range(20)])
     return pipeline
 
 
@@ -347,7 +347,7 @@ def test_main_speakers_below_one_returns_1_before_pipeline(tmp_path, monkeypatch
     def boom(*args, **kwargs):
         raise RuntimeError("сюда пайплайн специально не должен дойти")
 
-    monkeypatch.setattr(cli.audio, "extract_wav", boom)
+    monkeypatch.setattr(audio, "extract_wav", boom)
     existing = tmp_path / "запись.mp4"
     existing.write_bytes(b"")
 
@@ -402,7 +402,7 @@ def test_main_bad_names_value_error_caught_by_generic_handler(tmp_path, monkeypa
     def boom(*args, **kwargs):
         raise RuntimeError("сюда пайплайн специально не должен дойти")
 
-    monkeypatch.setattr(cli.audio, "extract_wav", boom)
+    monkeypatch.setattr(audio, "extract_wav", boom)
 
     code = cli.main([str(existing), "--names", "0=Судья"])
     captured = capsys.readouterr()
@@ -429,7 +429,7 @@ def test_main_tile_speakers_invalid_value_returns_1_before_pipeline(tmp_path, mo
     def boom(*args, **kwargs):
         raise RuntimeError("сюда пайплайн специально не должен дойти")
 
-    monkeypatch.setattr(cli.audio, "extract_wav", boom)
+    monkeypatch.setattr(audio, "extract_wav", boom)
 
     code = cli.main([str(existing), "--tile-speakers", "0"])
     err = capsys.readouterr().err
@@ -450,15 +450,15 @@ def test_main_tile_speakers_length_mismatch_after_step_2_returns_1(tmp_path, mon
     existing = tmp_path / "запись.mp4"
     existing.write_bytes(b"")
 
-    monkeypatch.setattr(cli.audio, "extract_wav", lambda src, dst, denoise=False: dst)
-    monkeypatch.setattr(cli.audio, "probe_duration", lambda path: 1.0)
-    monkeypatch.setattr(cli.video, "has_video", lambda *_: True)
-    monkeypatch.setattr(cli.video, "find_tiles", lambda *_: [cli.video.Tile(0, 0, 3, 10), cli.video.Tile(20, 0, 3, 10)])
+    monkeypatch.setattr(audio, "extract_wav", lambda src, dst, denoise=False: dst)
+    monkeypatch.setattr(audio, "probe_duration", lambda path: 1.0)
+    monkeypatch.setattr(video, "has_video", lambda *_: True)
+    monkeypatch.setattr(video, "find_tiles", lambda *_, **__: [video.Tile(0, 0, 3, 10), video.Tile(20, 0, 3, 10)])
 
     def boom(*args, **kwargs):
         raise RuntimeError("сюда пайплайн специально не должен дойти")
 
-    monkeypatch.setattr(cli.asr, "transcribe", boom)
+    monkeypatch.setattr(asr, "transcribe", boom)
 
     code = cli.main([str(existing), "--tile-speakers", "1,1,1"])
     err = capsys.readouterr().err
@@ -515,8 +515,8 @@ def test_main_tile_speakers_without_tiles_says_so_instead_of_silently_ignoring(f
     """Плиток нет вовсе (аудиофайл, --no-video, подсветка не найдена) — делить
     по плиткам нечего, и --tile-speakers не используется. Раньше об этом
     нельзя было догадаться иначе как по числу участников в итоговой сводке."""
-    monkeypatch.setattr(cli.video, "has_video", lambda path: False)
-    monkeypatch.setattr(cli.diarization, "diarize", lambda *a, **k: [cli.diarization.Turn(0.0, 20.0, 0)])
+    monkeypatch.setattr(video, "has_video", lambda path: False)
+    monkeypatch.setattr(diarization, "diarize", lambda *a, **k: [diarization.Turn(0.0, 20.0, 0)])
 
     code = fake_pipeline.run("--tile-speakers", "3,1,1")
     out = capsys.readouterr().out
@@ -536,7 +536,7 @@ def test_main_tile_speakers_number_of_dead_tile_is_ignored_not_shifted(fake_pipe
     def boom(*args, **kwargs):
         raise AssertionError("k=1 у обеих доживших плиток: до отпечатков дело доходить не должно")
 
-    monkeypatch.setattr(cli.diarization, "embed", boom)
+    monkeypatch.setattr(diarization, "embed", boom)
 
     code = fake_pipeline.run("--tile-speakers", "1,9,1")
     out = capsys.readouterr().out
@@ -577,7 +577,7 @@ def test_main_creates_output_directory_before_pipeline_starts(tmp_path, monkeypa
     def boom(*args, **kwargs):
         raise RuntimeError("сюда пайплайн специально не должен дойти по-настоящему")
 
-    monkeypatch.setattr(cli.audio, "extract_wav", boom)
+    monkeypatch.setattr(audio, "extract_wav", boom)
 
     code = cli.main([str(existing), "-o", str(output_path)])
 
@@ -631,7 +631,7 @@ def test_main_generic_handler_catches_expected_exceptions_without_traceback(tmp_
     def raiser(*args, **kwargs):
         raise exc
 
-    monkeypatch.setattr(cli.audio, "extract_wav", raiser)
+    monkeypatch.setattr(audio, "extract_wav", raiser)
 
     code = cli.main([str(existing)])
     err = capsys.readouterr().err
@@ -670,7 +670,7 @@ def test_main_broken_pipe_error_returns_0_without_error_message(tmp_path, monkey
     def raiser(*args, **kwargs):
         raise BrokenPipeError
 
-    monkeypatch.setattr(cli.audio, "extract_wav", raiser)
+    monkeypatch.setattr(audio, "extract_wav", raiser)
 
     code = cli.main([str(existing)])
     err = capsys.readouterr().err
@@ -689,7 +689,7 @@ def test_main_keyboard_interrupt_is_not_caught_by_generic_handler(tmp_path, monk
     def raiser(*args, **kwargs):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(cli.audio, "extract_wav", raiser)
+    monkeypatch.setattr(audio, "extract_wav", raiser)
 
     code = cli.main([str(existing)])
     err = capsys.readouterr().err
@@ -717,7 +717,7 @@ def test_main_traceback_env_var_lets_exception_through(tmp_path, monkeypatch):
     def raiser(*args, **kwargs):
         raise RuntimeError("maximum recursion depth exceeded")
 
-    monkeypatch.setattr(cli.audio, "extract_wav", raiser)
+    monkeypatch.setattr(audio, "extract_wav", raiser)
 
     with pytest.raises(RuntimeError, match="maximum recursion depth"):
         cli.main([str(existing)])
@@ -734,7 +734,7 @@ def test_main_traceback_env_var_off_values_keep_one_line_message(tmp_path, monke
     def raiser(*args, **kwargs):
         raise RuntimeError("что-то пошло не так")
 
-    monkeypatch.setattr(cli.audio, "extract_wav", raiser)
+    monkeypatch.setattr(audio, "extract_wav", raiser)
 
     code = cli.main([str(existing)])
 
@@ -752,7 +752,7 @@ def test_main_traceback_env_var_does_not_change_keyboard_interrupt(tmp_path, mon
     def raiser(*args, **kwargs):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(cli.audio, "extract_wav", raiser)
+    monkeypatch.setattr(audio, "extract_wav", raiser)
 
     assert cli.main([str(existing)]) == 130
     assert "Прервано пользователем" in capsys.readouterr().err
@@ -767,8 +767,8 @@ def test_main_traceback_env_var_does_not_make_video_failure_fatal(fake_pipeline,
     def raiser(*args, **kwargs):
         raise RuntimeError("видео нестандартное")
 
-    monkeypatch.setattr(cli.video, "find_tiles", raiser)
-    monkeypatch.setattr(cli.diarization, "diarize", lambda *a, **k: [cli.diarization.Turn(0.0, 20.0, 0)])
+    monkeypatch.setattr(video, "find_tiles", raiser)
+    monkeypatch.setattr(diarization, "diarize", lambda *a, **k: [diarization.Turn(0.0, 20.0, 0)])
 
     code = fake_pipeline.run()
     captured = capsys.readouterr()

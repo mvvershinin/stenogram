@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -23,6 +24,14 @@ _SEG_THRESHOLD = 0.5
 _MIN_EMBED_SEC = 0.4
 
 
+def _report(progress: bool | Callable[[str, float | None], None], message: str, fraction: float | None = None) -> None:
+    """Сообщение о ходе работы: в stdout, в функцию вызывающего или никуда."""
+    if callable(progress):
+        progress(message, fraction)
+    elif progress:
+        print(message, flush=True)
+
+
 @dataclass
 class Turn:
     start: float
@@ -34,7 +43,7 @@ class Turn:
         return self.end - self.start
 
 
-def segment(audio: np.ndarray, num_threads: int = 4, progress: bool = True) -> list[Turn]:
+def segment(audio: np.ndarray, num_threads: int = 4, progress: bool | Callable[[str, float | None], None] = True) -> list[Turn]:
     """Границы реплик. Метки говорящих на этом шаге черновые и позже заменяются."""
     import sherpa_onnx  # noqa: PLC0415 -- тяжёлый импорт: должен остаться внутри функции
 
@@ -57,7 +66,7 @@ def segment(audio: np.ndarray, num_threads: int = 4, progress: bool = True) -> l
         pct = int(done / total * 100)
         if progress and pct >= last[0] + 10:
             last[0] = pct
-            print(f"  сегментация {pct}%", flush=True)
+            _report(progress, f"  сегментация {pct}%", pct / 100)
         return 0
 
     result = sd.process(audio, callback=report if progress else None).sort_by_start_time()
@@ -205,11 +214,17 @@ def _fill_short(turns: list[Turn], kept: list[int], labels: np.ndarray) -> None:
         turn.speaker = turns[min(near, key=lambda j: abs(turns[j].start - turn.start))].speaker if near else 0
 
 
-def diarize(audio: np.ndarray, num_speakers: int | None = None, max_speakers: int = 12, num_threads: int = 4, progress: bool = True) -> list[Turn]:
+def diarize(
+    audio: np.ndarray,
+    num_speakers: int | None = None,
+    max_speakers: int = 12,
+    num_threads: int = 4,
+    progress: bool | Callable[[str, float | None], None] = True,
+) -> list[Turn]:
     """Только по звуку: сегментация → эмбеддинги → кластеризация → сглаживание."""
     turns = segment(audio, num_threads=num_threads, progress=progress)
     if progress:
-        print(f"      реплик размечено: {len(turns)}", flush=True)
+        _report(progress, f"      реплик размечено: {len(turns)}")
 
     embeddings, kept = embed(audio, turns, num_threads=num_threads)
     weights = np.array([turns[i].duration for i in kept], dtype=np.float64)
@@ -217,7 +232,7 @@ def diarize(audio: np.ndarray, num_speakers: int | None = None, max_speakers: in
     if num_speakers is None:
         num_speakers = estimate_speakers(embeddings, max_speakers=max_speakers)
         if progress:
-            print(f"      оценка числа участников: {num_speakers}", flush=True)
+            _report(progress, f"      оценка числа участников: {num_speakers}")
 
     labels = cluster(embeddings, weights, num_speakers, gaps=_gaps_between(turns, kept))
     _fill_short(turns, kept, labels)
@@ -225,7 +240,12 @@ def diarize(audio: np.ndarray, num_speakers: int | None = None, max_speakers: in
 
 
 def diarize_with_video(
-    audio: np.ndarray, video_turns: list[Turn], num_speakers: int | None = None, tile_speakers: list[int] | None = None, num_threads: int = 4, progress: bool = True
+    audio: np.ndarray,
+    video_turns: list[Turn],
+    num_speakers: int | None = None,
+    tile_speakers: list[int] | None = None,
+    num_threads: int = 4,
+    progress: bool | Callable[[str, float | None], None] = True,
 ) -> tuple[list[Turn], dict[int, int]]:
     """Гибрид: видео говорит, какая плитка активна, звук делит людей внутри плитки.
 
@@ -240,7 +260,7 @@ def diarize_with_video(
     speech = {tile: sum(t.duration for t in video_turns if t.speaker == tile) for tile in tiles}
     if progress:
         for tile in tiles:
-            print(f"      плитка {tile + 1}: {speech[tile] / 60:.1f} мин речи", flush=True)
+            _report(progress, f"      плитка {tile + 1}: {speech[tile] / 60:.1f} мин речи")
 
     # Проверка и приведение к словарю — до сегментации: незачем тратить минуты на звук,
     # если --tile-speakers заведомо не сойдётся с плитками.
@@ -268,7 +288,7 @@ def diarize_with_video(
             for turn in inside:
                 result.append(Turn(turn.start, turn.end, offset + turn.speaker))
             if progress:
-                print(f"      плитка {tile + 1}: разделена на {len(set(t.speaker for t in inside))}", flush=True)
+                _report(progress, f"      плитка {tile + 1}: разделена на {len(set(t.speaker for t in inside))}")
         offset += k
 
     result.sort(key=lambda t: t.start)

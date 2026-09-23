@@ -22,7 +22,8 @@ asr                    ни от чего не зависит вовсе
 diarization → audio, models
 align       → asr, diarization
 render      → align
-cli         → все
+pipeline    → audio, video, asr, diarization, align
+cli         → pipeline, align, render
 ```
 
 Проверка:

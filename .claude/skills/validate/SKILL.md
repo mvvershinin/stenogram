@@ -27,7 +27,8 @@ grep -n "^import sklearn\|^import sherpa\|^from faster_whisper\|^import faster_w
 
 Зависимости строго в одну сторону: `audio`, `models` — нижний слой; `video` → `audio`;
 `asr` — ни от чего; `diarization` → `audio`, `models`; `align` → `asr`, `diarization`;
-`render` → `align`; `cli` → все.
+`render` → `align`; `pipeline` → `audio`, `video`, `asr`,
+`diarization`, `align`; `cli` → `pipeline`, `align`, `render`.
 
 `asr.py` обязан оставаться полностью автономным.
 

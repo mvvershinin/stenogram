@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import subprocess
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,6 +35,14 @@ _CHUNK_BYTES = 32 * 1024 * 1024
 # пикселя независимо от соседей, поэтому счёт полосами даёт тот же результат вплоть
 # до бита — проверено поэлементно на нескольких формах массива.
 _BAND_BYTES = 32 * 1024 * 1024
+
+
+def _report(progress: bool | Callable[[str, float | None], None], message: str, fraction: float | None = None) -> None:
+    """Сообщение о ходе работы: в stdout, в функцию вызывающего или никуда."""
+    if callable(progress):
+        progress(message, fraction)
+    elif progress:
+        print(message, flush=True)
 
 
 @dataclass
@@ -165,7 +174,7 @@ def _swing(sat: np.ndarray) -> np.ndarray:
     return swing
 
 
-def find_tiles(path: Path, samples: int = 120, progress: bool = True) -> list[Tile]:
+def find_tiles(path: Path, samples: int = 120, progress: bool | Callable[[str, float | None], None] = True) -> list[Tile]:
     """Ищет плитки участников по мерцающей рамке подсветки.
 
     Рамки одной плитки (левая и правая) загораются одновременно, рамки разных плиток —
@@ -176,7 +185,7 @@ def find_tiles(path: Path, samples: int = 120, progress: bool = True) -> list[Ti
     duration = _duration(path)
     fps = max(samples / max(duration, 1.0), 0.02)
     if progress:
-        print(f"      ищу плитки участников ({width}x{height}) ...", flush=True)
+        _report(progress, f"      ищу плитки участников ({width}x{height}) ...")
 
     # рамка цветная, фон серый; предел чтения — из фактической формулы, а не из samples
     sat = _probe_saturation(path, fps, width, height, _probe_frame_limit(duration, fps, samples))
@@ -231,7 +240,7 @@ def find_tiles(path: Path, samples: int = 120, progress: bool = True) -> list[Ti
 
     tiles.sort(key=lambda t: t.x)
     if progress:
-        print(f"      плиток найдено: {len(tiles)}", flush=True)
+        _report(progress, f"      плиток найдено: {len(tiles)}")
     return tiles
 
 
@@ -243,7 +252,7 @@ def _duration(path: Path) -> float:
     return float(out.stdout.strip())
 
 
-def active_speaker(path: Path, tiles: list[Tile], fps: float = PROBE_FPS, progress: bool = True) -> tuple[np.ndarray, float]:
+def active_speaker(path: Path, tiles: list[Tile], fps: float = PROBE_FPS, progress: bool | Callable[[str, float | None], None] = True) -> tuple[np.ndarray, float]:
     """Для каждого момента времени — индекс подсвеченной плитки (или -1).
 
     Возвращает (метки по кадрам, шаг по времени в секундах).
@@ -263,7 +272,7 @@ def active_speaker(path: Path, tiles: list[Tile], fps: float = PROBE_FPS, progre
         # «Цветность» рамки: насколько пиксель далёк от серого.
         signals.append(px.max(axis=1) - px.min(axis=1))
         if progress:
-            print(f"      подсветка плитки {i + 1}/{len(tiles)}", flush=True)
+            _report(progress, f"      подсветка плитки {i + 1}/{len(tiles)}", (i + 1) / len(tiles))
 
     n = min(len(s) for s in signals)
     matrix = np.stack([s[:n] for s in signals])
