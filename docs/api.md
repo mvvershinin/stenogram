@@ -354,12 +354,25 @@ render.write(utterances, Path("совещание"), ["txt", "srt"],
 
 `$STENOGRAM_HOME` либо `~/.cache/stenogram`.
 
-### `ensure_segmentation_model() -> Path` · `ensure_embedding_model() -> Path` · `ensure_all() -> tuple[Path, Path]`
+### `ensure_segmentation_model(root=None, timeout=30.0) -> Path` · `ensure_embedding_model(root=None, timeout=30.0) -> Path` · `ensure_all(root=None, timeout=30.0) -> tuple[Path, Path]`
 
-Возвращают пути к моделям, скачивая при необходимости. Повторные вызовы бесплатны.
+Возвращают пути к ONNX-моделям разметки, скачивая при необходимости в `root` (умолчание —
+`cache_dir()`) с таймаутом `timeout` секунд на сетевой запрос. Повторные вызовы бесплатны.
+`root` — параметр только для встраивания и тестов; CLI его не выставляет, всегда
+`cache_dir()` — так же, как `diarization.py`, единственный другой потребитель.
 
 Чтобы подставить свою модель отпечатков, переопределите `models.EMBEDDING_URL` и
 `models.EMBEDDING_FILE` до первого вызова. Требования: ONNX, вход 16 кГц моно.
+
+### `ensure_whisper_model(model_name, download_root=None, local_files_only=False) -> str` · `check_all(...) -> list[str]` · `fetch_all(...) -> None`
+
+Модель распознавания — через `faster_whisper.download_model`; `download_root` уходит
+в `cache_dir` этой функции, тот же параметр, что `download_root` в `asr.load_model`.
+`model_name` принимает и путь к готовому каталогу модели — тогда сеть не трогается
+вовсе, только проверяются `model.bin`/`config.json`/`tokenizer.json`/`vocabulary.*`.
+`check_all`/`fetch_all` покрывают обе модели разом (ONNX-разметку и whisper) — их
+использует `python -m stenogram.models --check`/`--fetch`, подготовка моделей для
+машины без сети, см. `docs/эксплуатация.md`.
 
 ---
 
