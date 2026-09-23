@@ -1,0 +1,45 @@
+# Контекст сборки docker-compose.yml — корень репозитория (service/Dockerfile
+# собирает и stenogram, и service/ вместе). Держать его маленьким и без секретов.
+#
+# ВАЖНО: в отличие от .gitignore, паттерн без `**/` в .dockerignore матчится
+# только в корне контекста, а не на любой глубине (задокументированное отличие
+# синтаксиса от .gitignore) — `__pycache__/` не поймал бы `stenogram/__pycache__`
+# или `service/stenogram_service/__pycache__`. Каждый паттерн ниже — с `**/`.
+
+.git/
+**/venv/
+**/.venv/
+**/__pycache__/
+**/*.py[cod]
+**/*.egg-info/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.env
+**/.env.*
+!**/.env.example
+
+# Модели и медиа — не должны попасть в образ ни при каких обстоятельствах:
+# монтируются томами (service/README.md), не вшиваются.
+**/models/
+**/*.onnx
+**/*.bin
+**/*.ct2
+**/*.tar.bz2
+**/*.mp4
+**/*.mkv
+**/*.avi
+**/*.mov
+**/*.webm
+**/*.mp3
+**/*.m4a
+**/*.wav
+**/*.ogg
+**/*.flac
+
+# Документация и планы разработки образу не нужны
+docs/
+.docs/
+**/*.md
+!README.md
+!service/README.md

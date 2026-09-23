@@ -1,0 +1,248 @@
+# Локальный/офлайн стенд: MinIO + API + воркер, один хост, один процесс на каждый.
+#
+# Подготовка (однократно, с сетью — образы и модели тянутся ДО того, как контур
+# закрывается, ровно как в docs/эксплуатация.md для пакета stenogram):
+#
+#   cp .env.example .env                      # заполнить пути к моделям, см. ниже
+#   docker compose --profile cpu build
+#   docker compose --profile cpu up -d
+#
+# --profile cpu (или gpu) ОБЯЗАТЕЛЕН — без него ни один воркер не поднимется:
+# `worker` и `worker-cuda` взаимоисключающие (см. комментарий у `worker` ниже),
+# у обоих есть свой профиль, и по умолчанию (без --profile) ни один сервис с
+# профилем не стартует. Голый `docker compose up -d` поднимет только minio/api.
+#
+# Модели НЕ качаются образом и не лежат в репозитории — см. service/README.md,
+# раздел «Подготовка моделей». STENOGRAM_MODELS_DIR/STENOGRAM_WHISPER_MODELS_DIR
+# в .env указывают на уже готовые каталоги (--fetch или существующий кэш).
+#
+# Сеть `internal` помечена `internal: true`: ни один контейнер здесь не достаёт до
+# интернета — это то, что делает офлайн-приёмку офлайн-приёмкой, а не просто
+# «мы не полезли в сеть, но могли бы». `worker` и `minio` сидят только в ней.
+#
+# `api` тоже трогает модели (`/healthz` → `models.check_all`), значит тоже обязан
+# быть без доступа в интернет — но ему ещё нужен рабочий `ports:` для доступа с
+# хоста, а `internal: true` его в этом докере (rootless) ломает начисто: у
+# контейнера пустой Gateway, `docker port` ничего не показывает, DNAT не создаётся
+# (проверено эмпирически). Поэтому `api` — на отдельной сети `edge`: обычный bridge,
+# но с `enable_ip_masquerade: false` (см. ниже) — это убирает SNAT для исходящих,
+# и у контейнера не остаётся обратного маршрута наружу (`Network is unreachable`
+# при попытке, проверено), а входящий DNAT публикуемого порта на эту цепочку не
+# завязан и продолжает работать. То есть `api` без интернета ровно как `worker`,
+# просто другим сетевым механизмом — единственным, что даёт вместе и то, и другое.
+
+x-image: &image
+  build:
+    context: ..
+    dockerfile: service/Dockerfile
+    target: base
+    # target ОБЯЗАТЕЛЕН: без него и `docker build`, и `docker compose build` берут
+    # ПОСЛЕДНЮЮ стадию Dockerfile по умолчанию — это `cuda` (см. ниже), а не `base`.
+    # Без этой строки api/worker молча собирались бы из cuda-стадии: находка при
+    # проверке .dockerignore на реальной сборке — образ вышел 5.58 ГБ вместо
+    # ожидаемых ~450 МБ, `pip list` внутри показывал nvidia-cublas-cu12/nvidia-cudnn-cu12.
+  # profiles задаются на уровне сервиса, не якоря — см. api/worker ниже.
+
+networks:
+  internal:
+    internal: true
+  edge:
+    driver_opts:
+      # Отключает MASQUERADE (SNAT) для исходящих — без него у контейнера нет
+      # обратного маршрута наружу, тот же эффект «нет интернета», что у `internal`,
+      # но входящий DNAT публикуемого порта не завязан на эту цепочку и продолжает
+      # работать (проверено ниже, см. service/README.md «Проверка офлайн»).
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+
+volumes:
+  minio-data:
+  jobs-data: # /data: SQLite очереди + рабочие каталоги задач — общий для api и worker
+
+services:
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-04-08T15-41-24Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?задайте в .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?задайте в .env}
+    volumes:
+      - minio-data:/data
+    networks: [internal]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # Разовая настройка: бакет создаётся при первом поднятии стенда и не пересоздаётся —
+  # `--ignore-existing`. Завершается кодом 0 и выходит, `docker compose up` не виснет
+  # на нём (condition: service_completed_successfully у зависимых).
+  minio-init:
+    image: quay.io/minio/mc:RELEASE.2025-04-08T15-39-49Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks: [internal]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?задайте в .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?задайте в .env}
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 \"$$MINIO_ROOT_USER\" \"$$MINIO_ROOT_PASSWORD\" &&
+      mc mb --ignore-existing local/stenogram
+      "
+
+  api:
+    <<: *image
+    command: ["python", "-m", "stenogram_service.api", "--host", "0.0.0.0", "--port", "8000"]
+    # Не полный набор Settings — только то, что api реально читает (проверено по
+    # коду: api.py и manifest.py трогают db_path, whisper_model, whisper_dir,
+    # device, compute_type — и ничего больше). Ни S3-эндпоинта, ни ключей MinIO,
+    # ни STENOGRAM_WORKDIR здесь нет НАМЕРЕННО: api никогда не создаёт Storage/
+    # MinioStorage и не собирает Workspace (это делает только worker) — передавать
+    # ему пароль от MinIO было бы лишним доступом без всякой пользы.
+    environment:
+      STENOGRAM_DB: /data/jobs.sqlite
+      STENOGRAM_WHISPER_MODEL: ${STENOGRAM_WHISPER_MODEL:-large-v3-turbo}
+      STENOGRAM_WHISPER_DIR: /models/whisper
+      STENOGRAM_HOME: /models/stenogram
+      STENOGRAM_DEVICE: cpu
+      STENOGRAM_COMPUTE_TYPE: int8
+    volumes:
+      - jobs-data:/data
+      # read-only: ни api (/healthz), ни worker модели не изменяют, только читают.
+      - ${STENOGRAM_MODELS_DIR:?задайте в .env — каталог ONNX-моделей разметки}:/models/stenogram:ro
+      - ${STENOGRAM_WHISPER_MODELS_DIR:?задайте в .env — каталог модели whisper}:/models/whisper:ro
+    # Без depends_on на minio: api никогда не ходит в S3 (только worker держит
+    # клиент MinIO), поэтому очерёдность старта относительно minio-init api не важна.
+    networks: [edge]
+    ports:
+      - "${STENOGRAM_API_PORT:-8000}:8000"
+    restart: unless-stopped
+    healthcheck:
+      # Без curl в образе (не добавляли ради одной проверки) — urllib из stdlib.
+      # Первый /healthz внутри процесса импортирует faster_whisper (models.check_all);
+      # start_period больше обычного, чтобы этот разовый импорт не считался отказом.
+      test: ["CMD", "python", "-c", "import urllib.request as u; import sys; sys.exit(0 if u.urlopen('http://127.0.0.1:8000/healthz', timeout=4).status == 200 else 1)"]
+      interval: 10s
+      timeout: 6s
+      retries: 6
+      start_period: 40s
+
+  # worker и worker-cuda — взаимоисключающие: один и тот же STENOGRAM_CACHE_BUCKET
+  # и общий том jobs-data, оба разберут одну и ту же очередь, если поднимутся
+  # вместе. Профили `cpu`/`gpu` разводят их по разным `docker compose --profile`,
+  # а не один без профиля + другой в `gpu`: без профиля у обоих сервис без
+  # профиля стартует ВСЕГДА, и `--profile gpu up` поднимал бы и его, и cuda-версию
+  # разом — было так и оказалось багом ревью. Схема запуска — service/README.md.
+  worker:
+    <<: *image
+    profiles: ["cpu"]
+    environment: &env
+      STENOGRAM_DB: /data/jobs.sqlite
+      STENOGRAM_WORKDIR: /data/work
+      STENOGRAM_S3_ENDPOINT: minio:9000
+      STENOGRAM_S3_ACCESS_KEY: ${MINIO_ROOT_USER:?задайте в .env}
+      STENOGRAM_S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?задайте в .env}
+      STENOGRAM_S3_SECURE: "false"
+      STENOGRAM_CACHE_BUCKET: stenogram
+      STENOGRAM_WHISPER_MODEL: ${STENOGRAM_WHISPER_MODEL:-large-v3-turbo}
+      STENOGRAM_WHISPER_DIR: /models/whisper
+      STENOGRAM_HOME: /models/stenogram
+      STENOGRAM_DEVICE: cpu
+      STENOGRAM_COMPUTE_TYPE: int8
+      # Явно, а не только умолчание Settings: этим же значением (не хардкодом)
+      # считает порог свежести healthcheck ниже — один источник истины на двоих.
+      STENOGRAM_HEARTBEAT: ${STENOGRAM_HEARTBEAT:-15}
+    volumes:
+      - jobs-data:/data
+      - ${STENOGRAM_MODELS_DIR:?задайте в .env — каталог ONNX-моделей разметки}:/models/stenogram:ro
+      - ${STENOGRAM_WHISPER_MODELS_DIR:?задайте в .env — каталог модели whisper}:/models/whisper:ro
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    networks: [internal]
+    restart: unless-stopped
+    # SIGTERM прерывает текущую задачу на БЛИЖАЙШЕМ событии прогресса (worker.py,
+    # класс Progress). Сегментация репортит прогресс каждые 10% (diarization.py,
+    # segment()), но следующий за ней шаг — отпечатки и кластеризация (embed +
+    # cluster) — прогресс не шлёт вовсе и молчит целиком: docs/эксплуатация.md
+    # называет ~1 минуту на этот шаг на час записи на CPU. Меньший grace period
+    # не даёт ошибки — оркестратор просто добивает SIGKILL раньше, чем воркер успел
+    # дойти до следующей проверки, и здоровая задача сгорает попыткой (SIGKILL
+    # воркер не успевает сам вернуть job в очередь). 600s — запас поверх этой
+    # минуты на случай записи длиннее часа (масштаб не измерен, значение с запасом,
+    # а не по прямому замеру).
+    stop_grace_period: 600s
+    healthcheck: &worker-healthcheck
+      # У воркера нет HTTP — сигнал живости, доступный докеру без обращения к
+      # SQLite изнутри контейнера, это файл-пульс `<рабочий каталог воркера>.alive`
+      # (worker.py: Worker._touch_alive, обновляется и в простое между задачами,
+      # и на каждом тике Heartbeat во время обработки — то есть и на тихих этапах
+      # тоже, ПОКА не сработал сторож зависания Heartbeat.stall_timeout — тогда
+      # файл перестаёт обновляться намеренно, и это НЕ баг healthcheck, а его
+      # смысл: см. STENOGRAM_STALL_TIMEOUT в config.py).
+      #
+      # glob('*.alive') — потому что имя файла содержит hostname/pid/uuid
+      # процесса (worker.py: Workspace), а не фиксировано; фильтр по socket.
+      # gethostname() ОБЯЗАТЕЛЕН — том jobs-data общий, и без фильтра healthcheck
+      # контейнера А мог бы решить, что жив, увидев свежий .alive контейнера Б
+      # (регресс ревью: раньше проверялся «любой» файл в каталоге). Сравнение —
+      # по ЦЕЛОМУ дефис-сегменту имени (`...split('-')`), не по вхождению
+      # подстроки: имя вида stenogram-worker-<host>-<pid>-<uuid8>.alive, и
+      # substring-проверка совпала бы, случись hostname подстрокой pid/uuid8
+      # или другого hostname (регресс ревью: раньше был просто `h in basename`).
+      #
+      # Порог свежести — не число, а STENOGRAM_HEARTBEAT (то же значение, что
+      # видит сам процесс) × 4: тройного-четверного такта достаточно, чтобы не
+      # мигать unhealthy от случайной задержки одного удара, но не растягивать
+      # порог на порядки при нестандартном STENOGRAM_HEARTBEAT.
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import glob,os,socket,sys,time; h=socket.gethostname(); t=float(os.environ.get('STENOGRAM_HEARTBEAT','15'))*4; f=[p for p in glob.glob('/data/work/*.alive') if h in os.path.basename(p).removesuffix('.alive').split('-')]; sys.exit(0 if f and any(time.time()-os.path.getmtime(p)<t for p in f) else 1)",
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  # CUDA-вариант воркера — та же команда и переменные, другой образ (стадия `cuda`
+  # в service/Dockerfile) и запрос видеокарты. Профиль `gpu`, а не `cpu`: запуск —
+  # `docker compose --profile gpu up`, а не «--profile gpu up worker-cuda» —
+  # тогда `worker` (профиль cpu) не поднимается вовсе, см. заметку над `worker`.
+  # НЕ ПРОВЕРЕНО НА ЖЕЛЕЗЕ — на этой машине карты нет, см. service/Dockerfile
+  # и docs/ускорение-на-gpu.md.
+  worker-cuda:
+    build:
+      context: ..
+      dockerfile: service/Dockerfile
+      target: cuda
+    profiles: ["gpu"]
+    command: ["python", "-m", "stenogram_service.worker"]
+    environment:
+      <<: *env
+      STENOGRAM_DEVICE: cuda
+      STENOGRAM_COMPUTE_TYPE: float16
+    volumes:
+      - jobs-data:/data
+      - ${STENOGRAM_MODELS_DIR:?задайте в .env — каталог ONNX-моделей разметки}:/models/stenogram:ro
+      - ${STENOGRAM_WHISPER_MODELS_DIR:?задайте в .env — каталог модели whisper}:/models/whisper:ro
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    networks: [internal]
+    restart: unless-stopped
+    stop_grace_period: 600s
+    healthcheck: *worker-healthcheck
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

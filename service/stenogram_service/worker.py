@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import gc
 import logging
@@ -34,6 +35,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from pydantic import ValidationError
 
 from stenogram import asr, diarization, models, pipeline, render
@@ -77,6 +79,10 @@ class Workspace:
 
     def __init__(self, root: Path):
         self.root = Path(root)
+        # STENOGRAM_WORKDIR — часто свежий том (docker-compose.yml), а не каталог,
+        # который кто-то создал заранее: без этого первый же запуск падает на
+        # открытии lock-файла в несуществующей директории.
+        self.root.mkdir(parents=True, exist_ok=True)
         name = f"{WORKSPACE_PREFIX}{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
         self.path = self.root / name
         self._lock_path = self.root / f"{name}.lock"
@@ -97,6 +103,7 @@ class Workspace:
                     continue  # хозяин жив
                 shutil.rmtree(path, ignore_errors=True)
                 lock_path.unlink(missing_ok=True)
+                (self.root / f"{path.name}.alive").unlink(missing_ok=True)  # файл-пульс мёртвого воркера
             removed.append(path)
         if removed:
             log.warning("удалено каталогов мёртвых воркеров: %d", len(removed))
@@ -110,16 +117,75 @@ class Workspace:
 
 class Heartbeat:
     """Пульс отдельным потоком: этап отпечатков молчит минутами, и по сообщениям
-    прогресса живую задачу сочли бы зависшей."""
+    прогресса живую задачу сочли бы зависшей.
 
-    def __init__(self, store: JobStore, job: Job, interval: float):
-        self.store, self.job, self.interval = store, job, interval
+    `on_beat`, если задан, зовётся на каждый тик до записи в БД — этим пользуется
+    докер-healthcheck воркера (`Worker._touch_alive`): файл на диске обновляется
+    тем же тактом, что и пульс в БД, независимо от того, дошла ли запись до неё.
+
+    `stall_timeout` — сторож зависания, другая забота, чем сам пульс: пульс тикает
+    по расписанию НЕЗАВИСИМО от прогресса (иначе тихий этап сочли бы зависшим),
+    а `stall_timeout` следит именно за прогрессом — сколько времени НИ ОДНОГО
+    события не было. `mark_progress()` зовёт `Progress` на каждом событии
+    (включая чтение исходника по чанкам, `Worker._fetch`).
+
+    Сработавший сторож не просто перестаёт бить — он завершает процесс
+    `os._exit(1)`, немедленно и без `finally`/контекст-менеджеров. Так надо:
+    при ОДНОМ воркере (обычная топология — «одна видеокарта, один воркер»,
+    см. jobstore.py) `recover_stale` некому вызвать, пока этот же воркер сам
+    застрял внутри `process()` — «просто замолчать и ждать снаружи» никого не
+    разбудит. `os._exit` рвёт процесс сразу, каким бы ни было тело главного
+    потока (застрявший `subprocess.run` ffmpeg включительно — Linux убивает
+    все процессы PID-неймспейса контейнера вместе с его init-процессом);
+    `restart: unless-stopped` в `docker-compose.yml` поднимает контейнер
+    заново, а задачу, повисшую без пульса в БД, следующий(-ий после `stale_after`)
+    `recover_stale` — уже НОВОГО процесса — вернёт в очередь. Самоисцеления
+    (возобновиться, если прогресс всё-таки пришёл) больше нет: процесса к этому
+    моменту уже нет."""
+
+    def __init__(
+        self,
+        store: JobStore,
+        job: Job,
+        interval: float,
+        on_beat: Callable[[], None] | None = None,
+        *,
+        stall_timeout: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self.store, self.job, self.interval, self.on_beat = store, job, interval, on_beat
+        self.stall_timeout, self.clock = stall_timeout, clock
         self.lost = threading.Event()
+        self.stalled = threading.Event()
+        self._progress_lock = threading.Lock()
+        self._last_progress = clock()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._beat, name=f"heartbeat-{job.id[:8]}", daemon=True)
 
+    def mark_progress(self) -> None:
+        with self._progress_lock:
+            self._last_progress = self.clock()
+
+    def _since_progress(self) -> float:
+        with self._progress_lock:
+            return self.clock() - self._last_progress
+
     def _beat(self) -> None:
         while not self._stop.wait(self.interval):
+            since = self._since_progress()
+            if self.stall_timeout is not None and since > self.stall_timeout:
+                self.stalled.set()
+                # Без ключа/имени исходника — только id задачи и длительность тишины.
+                log.error(
+                    "job=%s сторож зависания: %.0f с без единого события прогресса (порог %.0f с) — принудительный выход процесса",
+                    self.job.id,
+                    since,
+                    self.stall_timeout,
+                )
+                os._exit(1)  # не возвращается; restart: unless-stopped поднимет контейнер заново
+            if self.on_beat is not None:
+                with contextlib.suppress(OSError):
+                    self.on_beat()
             try:
                 if not self.store.heartbeat(self.job.id, self.job.lease):
                     self.lost.set()
@@ -152,11 +218,13 @@ class Progress:
     def enter(self, stage: str) -> None:
         """Собственные этапы воркера: download, cache, upload."""
         self._check()
+        self.heartbeat.mark_progress()
         self.stage = stage
         self._write(stage, None, force=True)
 
     def __call__(self, event: pipeline.Event) -> None:
         self._check()
+        self.heartbeat.mark_progress()
         self.stage = event.stage
         self._write(event.stage, event.fraction, force=event.stage != self._written[0])
 
@@ -233,12 +301,24 @@ class Worker:
         self.settings, self.store, self.storage, self.whisper_model, self.clock = settings, store, storage, whisper_model, clock
         self.cache = cache_mod.Cache(storage, settings.cache_bucket, settings.cache_prefix)
         self.workspace = Workspace(Path(settings.workdir))
+        # Файл-пульс для докер-healthcheck: свежесть mtime — без доступа к SQLite
+        # изнутри контейнера. Обновляется в трёх местах: здесь (старт), на каждом
+        # круге serve() (воркер жив и простаивает между задачами) и на каждом тике
+        # Heartbeat (воркер жив и работает, даже если пайплайн молчит минутами).
+        self._alive_path = self.workspace.root / f"{self.workspace.path.name}.alive"
+        self._touch_alive()
         # Остановка: текущая задача прерывается на ближайшем событии и возвращается
         # в очередь без списания попытки, цикл завершается.
         self.stopping = threading.Event()
 
+    def _touch_alive(self) -> None:
+        # не критично: healthcheck просто не увидит свежий файл на этом такте
+        with contextlib.suppress(OSError):
+            self._alive_path.touch()
+
     def close(self) -> None:
         self.workspace.close()
+        self._alive_path.unlink(missing_ok=True)
 
     # --- цикл ---------------------------------------------------------------------
 
@@ -261,6 +341,7 @@ class Worker:
         """Цикл до `stopping`. Сбой круга (база занята, диск) не роняет воркер:
         лог, пауза, следующий круг. `once` — разобрать очередь и выйти."""
         while not self.stopping.is_set():
+            self._touch_alive()
             try:
                 took = self.run_once()
             except Exception as exc:
@@ -278,7 +359,7 @@ class Worker:
     def process(self, job: Job) -> None:
         started = self.clock()
         log.info("job=%s взята, попытка %d", job.id, job.attempts)
-        heartbeat = Heartbeat(self.store, job, self.settings.heartbeat_interval)
+        heartbeat = Heartbeat(self.store, job, self.settings.heartbeat_interval, on_beat=self._touch_alive, stall_timeout=self.settings.stall_timeout, clock=self.clock)
         progress = Progress(self.store, job, heartbeat, self.settings.progress_interval, self.clock, self.stopping)
         try:
             with heartbeat, tempfile.TemporaryDirectory(dir=self.workspace.path, prefix="job-") as tmp:
@@ -368,7 +449,10 @@ class Worker:
     def _fetch(self, job: Job, tmp: Path, progress: Progress) -> tuple[Path, str]:
         progress.enter("download")
         try:
-            return fetch_source(self.storage, job.source_uri, tmp)
+            # on_chunk — тот же mark_progress, что и у событий пайплайна: без него
+            # медленный канал на большом файле выглядел бы зависшим этапом download
+            # для сторожа (Heartbeat.stall_timeout), хотя байты исправно идут.
+            return fetch_source(self.storage, job.source_uri, tmp, on_chunk=progress.heartbeat.mark_progress)
         except InvalidURI as exc:
             raise JobFailure("invalid_params", str(exc)) from None
         except ObjectNotFound:
@@ -415,6 +499,22 @@ class Worker:
         return {"blocks": str(blocks_loc), "transcript": str(text_loc)}
 
 
+def cuda_preflight(whisper_model: Any) -> None:
+    """Пробное кодирование секунды тишины уже загруженной моделью.
+
+    `ctranslate2.get_cuda_device_count()` видит только драйвер и отвечает `1`,
+    даже когда faster-whisper не находит свои же CUDA-библиотеки (cuBLAS/cuDNN
+    приходят pip-пакетами `nvidia-cublas-cu12`/`nvidia-cudnn-cu12`, а без них на
+    `LD_LIBRARY_PATH` отказ приходит только на первом вызове энкодера — см.
+    `docs/ускорение-на-gpu.md` и `service/Dockerfile`). Не проверять на старте — значит
+    уронить первую же настоящую задачу минутами позже, после долгого download/decode.
+    Секунда тишины — дёшево и достаточно: до первого вызова `ctranslate2.models.Whisper`
+    дело просто не доходит, если библиотек нет."""
+    silence = np.zeros(16000, dtype=np.float32)  # 1 секунда, 16 кГц, как весь пайплайн
+    segments, _ = whisper_model.transcribe(silence, beam_size=1, word_timestamps=False, vad_filter=False)
+    list(segments)  # генератор — сам проход энкодера происходит только при обходе
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m stenogram_service.worker", description="Воркер стенограмм: берёт задачи из очереди по одной")
     parser.add_argument("--once", action="store_true", help="разобрать очередь и выйти")
@@ -429,14 +529,45 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {line}", file=sys.stderr)
         return 1
 
-    whisper = asr.load_model(
-        settings.whisper_model,
-        device=settings.device,
-        compute_type=settings.compute_type,
-        num_threads=settings.resolved_threads(),
-        local_files_only=settings.local_files_only,
-        download_root=settings.whisper_dir,
-    )
+    def cuda_not_working(exc: Exception) -> int:
+        print("Воркер не запущен: CUDA не работает.", file=sys.stderr)
+        print(f"  {type(exc).__name__}: {exc}", file=sys.stderr)
+        print("  обычная причина — нет драйвера/карты либо faster-whisper не находит свои CUDA-библиотеки (LD_LIBRARY_PATH, см. service/Dockerfile)", file=sys.stderr)
+        return 1
+
+    try:
+        whisper = asr.load_model(
+            settings.whisper_model,
+            device=settings.device,
+            compute_type=settings.compute_type,
+            num_threads=settings.resolved_threads(),
+            local_files_only=settings.local_files_only,
+            download_root=settings.whisper_dir,
+        )
+    except Exception as exc:
+        # На cpu (и на auto, который сам решает, просто до выбора устройства дело
+        # тут ещё не дошло) отказ загрузки модели — что угодно (битый файл,
+        # нехватка памяти) — летит наружу как есть: это не тот класс проблем, для
+        # которого здесь придумана классификация. На явном cuda отказ уже здесь —
+        # почти наверняка «нет ни драйвера, ни карты» (ctranslate2 падает прямо
+        # внутри WhisperModel(...), до всякого cuda_preflight).
+        if settings.device != "cuda":
+            raise
+        return cuda_not_working(exc)
+
+    # STENOGRAM_DEVICE=auto сам решает cpu или cuda — какое устройство досталось
+    # на самом деле, знает только загруженная модель (ctranslate2.models.Whisper.device),
+    # а не запрошенное имя. Проверяем именно его: иначе на auto+cuda-железе
+    # пробное кодирование не запускалось бы вовсе, и та же гонка (get_cuda_device_count()
+    # видит только драйвер, без cuBLAS/cuDNN на LD_LIBRARY_PATH падает лишь первый
+    # настоящий энкод) ловилась бы уже на боевой задаче.
+    resolved_device = getattr(getattr(whisper, "model", None), "device", settings.device)
+    if resolved_device == "cuda":
+        try:
+            cuda_preflight(whisper)
+        except Exception as exc:
+            return cuda_not_working(exc)
+
     store = SqliteJobStore(Path(settings.db_path))
     storage = MinioStorage.connect(settings.s3_endpoint, settings.s3_access_key, settings.s3_secret_key, secure=settings.s3_secure, region=settings.s3_region)
     worker = Worker(settings, store, storage, whisper)

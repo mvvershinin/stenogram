@@ -201,13 +201,26 @@ def check_all(
     problems: list[str] = []
     root = _stenogram_home()
 
-    seg = root / SEGMENTATION_FILE
-    if not seg.exists():
-        problems.append(f"нет модели {SEGMENTATION_FILE} в {root}")
-
-    emb = root / EMBEDDING_FILE
-    if not emb.exists():
-        problems.append(f"нет модели {EMBEDDING_FILE} в {root}")
+    for filename in (SEGMENTATION_FILE, EMBEDDING_FILE):
+        target = root / filename
+        try:
+            found = target.exists()
+        except OSError as exc:
+            # Path.exists() глотает ENOENT/ENOTDIR и им подобные, но не EACCES:
+            # непрочитываемый каталог тома (например, из-за несовпадения UID между
+            # хостом и контейнером) иначе ронял бы check_all необработанным
+            # исключением вместо понятного «нет модели ... в ...».
+            problems.append(f"нет доступа к {filename} в {root}: {exc}")
+            continue
+        if not found:
+            problems.append(f"нет модели {filename} в {root}")
+        elif not os.access(target, os.R_OK):
+            # exists() успешен по правам РОДИТЕЛЯ (traversal), не по правам самого
+            # файла: файл без прав на чтение (мод 000/родительский volume с чужим
+            # владельцем) иначе засчитывался бы «моделью на месте», хотя открыть
+            # его на чтение нельзя — тот же класс отказа, что ловит diarization
+            # при настоящей попытке загрузить ONNX-модель, только раньше по времени.
+            problems.append(f"нет доступа к {filename} в {root}: файл не читается (нет прав)")
 
     try:
         ensure_whisper_model(whisper_model, download_root=whisper_dir, local_files_only=True)

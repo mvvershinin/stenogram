@@ -16,7 +16,7 @@ import os
 import re
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -102,11 +102,16 @@ class Storage(ABC):
     def exists(self, loc: Location) -> bool:
         """Нет объекта — False; нет бакета, прав или сети — исключение."""
 
-    def download(self, loc: Location, dst: Path) -> str:
+    def download(self, loc: Location, dst: Path, *, on_chunk: Callable[[], None] | None = None) -> str:
         """Скачивает объект в `dst`, по пути считая sha256; возвращает его hex.
 
         Пишет во временный файл рядом и переименовывает в конце: оборванная загрузка
-        не оставляет усечённый файл под итоговым именем."""
+        не оставляет усечённый файл под итоговым именем.
+
+        `on_chunk`, если задан, зовётся после каждого куска (`CHUNK` = 1 МиБ) — им
+        воркер отмечает прогресс во время самого скачивания (`Heartbeat.mark_progress`):
+        без этого медленный канал на большом файле выглядел бы как зависший этап
+        `download`, хотя данные исправно идут."""
         digest = hashlib.sha256()
         tmp = dst.with_name(f".{dst.name}.{uuid.uuid4().hex}.part")
         try:
@@ -114,6 +119,8 @@ class Storage(ABC):
                 for chunk in self.iter_object(loc):
                     digest.update(chunk)
                     f.write(chunk)
+                    if on_chunk is not None:
+                        on_chunk()
             os.replace(tmp, dst)
         finally:
             tmp.unlink(missing_ok=True)
@@ -131,16 +138,16 @@ class Storage(ABC):
 _EXT = re.compile(r"\.[a-z0-9]{1,8}")
 
 
-def fetch_source(storage: Storage, uri: str, workdir: Path) -> tuple[Path, str]:
+def fetch_source(storage: Storage, uri: str, workdir: Path, *, on_chunk: Callable[[], None] | None = None) -> tuple[Path, str]:
     """Скачивает исходник в `workdir` под именем `<sha256>.<ext>`; возвращает (путь, sha256).
 
     Настоящее имя файла дальше не идёт: иначе оно утекает в `[1/4] Извлекаю аудио из …`,
-    в «Источник» метаданных и в тексты ошибок ffmpeg."""
+    в «Источник» метаданных и в тексты ошибок ffmpeg. `on_chunk` — см. `Storage.download`."""
     loc = parse_uri(uri)
     ext = os.path.splitext(loc.key)[1].lower()
     ext = ext if _EXT.fullmatch(ext) else ""
     tmp = workdir / f"download-{uuid.uuid4().hex}{ext}"
-    sha256 = storage.download(loc, tmp)
+    sha256 = storage.download(loc, tmp, on_chunk=on_chunk)
     final = workdir / f"{sha256}{ext}"
     os.replace(tmp, final)
     return final, sha256

@@ -66,6 +66,20 @@ def test_download_streams_and_hashes(tmp_path, storage):
     assert sorted(p.name for p in tmp_path.iterdir()) == ["out.bin"]
 
 
+def test_download_calls_on_chunk_once_per_chunk(tmp_path, storage):
+    """`on_chunk` — то, чем воркер отмечает прогресс во время самого скачивания
+    (Heartbeat.mark_progress): без него медленный канал на большом файле выглядел
+    бы для сторожа зависания зависшим этапом download."""
+    data = bytes(range(256)) * 10  # storage.chunk по умолчанию 7 байт — много кусков
+    storage.objects[LOC] = data
+    calls = []
+
+    sha = storage.download(LOC, tmp_path / "out.bin", on_chunk=lambda: calls.append(1))
+
+    assert sha == hashlib.sha256(data).hexdigest()
+    assert len(calls) == -(-len(data) // storage.chunk)  # округление вверх, как в iter_object
+
+
 def test_fetch_source_names_file_by_hash_not_by_key(tmp_path, storage):
     data = b"\x00\x01video" * 1000
     storage.objects[LOC] = data
@@ -76,6 +90,16 @@ def test_fetch_source_names_file_by_hash_not_by_key(tmp_path, storage):
     assert path == tmp_path / f"{sha}.mp4"
     assert [p.name for p in tmp_path.iterdir()] == [f"{sha}.mp4"]
     assert "Петров" not in str(path)
+
+
+def test_fetch_source_passes_on_chunk_through_to_download(tmp_path, storage):
+    data = b"\x00\x01video" * 1000
+    storage.objects[LOC] = data
+    calls = []
+
+    fetch_source(storage, f"s3://records/{SECRET_KEY}", tmp_path, on_chunk=lambda: calls.append(1))
+
+    assert len(calls) > 1
 
 
 @pytest.mark.parametrize(("key", "ext"), [("x.MKV", ".mkv"), ("без расширения", ""), ("x.тест", ""), ("x.mp4 ; rm -rf", ""), ("x.tar.gz", ".gz")])

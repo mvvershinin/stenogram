@@ -445,6 +445,58 @@ def test_check_all_does_not_create_stenogram_home_directory(fake_faster_whisper,
     assert not stenogram_home.parent.exists()
 
 
+def test_check_all_reports_permission_denied_instead_of_raising(fake_faster_whisper, tmp_path, monkeypatch):
+    """Регресс с сквозной приёмки Docker-стенда (rootless-докер, разошедшийся UID
+    контейнера и хоста): Path.exists() глотает ENOENT, но не EACCES — непрочитываемый
+    каталог тома (мод 000, например, из-за неверного владельца при монтировании)
+    иначе ронял бы check_all необработанным PermissionError вместо списка проблем."""
+    stenogram_home = tmp_path / "stenogram"
+    blocked = stenogram_home / models.SEGMENTATION_FILE.split("/")[0]
+    blocked.mkdir(parents=True)
+    monkeypatch.setenv("STENOGRAM_HOME", str(stenogram_home))
+    monkeypatch.setattr(models.urllib.request, "urlopen", _boom_urlopen)
+    fake_faster_whisper.download_model = lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("нет модели"))
+    blocked.chmod(0o000)
+
+    try:
+        problems = models.check_all(whisper_model="large-v3-turbo")
+    finally:
+        blocked.chmod(0o755)  # иначе tmp_path не приберётся за тестом
+
+    assert len(problems) == 3
+    joined = "\n".join(problems)
+    assert "нет доступа" in joined
+    assert models.SEGMENTATION_FILE in joined
+
+
+def test_check_all_reports_permission_denied_for_unreadable_file_not_just_directory(fake_faster_whisper, tmp_path, monkeypatch):
+    """`Path.exists()` отвечает по правам РОДИТЕЛЯ (нужна только traversal), а не
+    по правам самого файла — файл без прав на чтение (мод 000, каталог вокруг него
+    читается нормально) иначе тихо считался бы «моделью на месте», хотя открыть его
+    для распознавания нельзя. Регрессия с ревью фазы 5: os.access(..., os.R_OK)
+    поверх exists()."""
+    stenogram_home = tmp_path / "stenogram"
+    seg = stenogram_home / models.SEGMENTATION_FILE
+    seg.parent.mkdir(parents=True)
+    seg.write_bytes(b"stub")
+    emb = stenogram_home / models.EMBEDDING_FILE
+    emb.write_bytes(b"stub")
+    monkeypatch.setenv("STENOGRAM_HOME", str(stenogram_home))
+    monkeypatch.setattr(models.urllib.request, "urlopen", _boom_urlopen)
+    snapshot = _model_dir_with_bin(tmp_path, "snapshot-ok")
+    fake_faster_whisper.download_model = lambda *a, **k: str(snapshot)
+    seg.chmod(0o000)
+
+    try:
+        problems = models.check_all(whisper_model="small")
+    finally:
+        seg.chmod(0o644)  # иначе tmp_path не приберётся за тестом
+
+    assert len(problems) == 1
+    assert "нет доступа" in problems[0]
+    assert models.SEGMENTATION_FILE in problems[0]
+
+
 # ---------------------------------------------------------------------------
 # fetch_all
 # ---------------------------------------------------------------------------

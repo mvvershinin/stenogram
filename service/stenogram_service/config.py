@@ -69,6 +69,26 @@ class Settings:
     max_attempts: int = 2
     progress_interval: float = 5.0  # не чаще — запись этапа и доли в базу
     poll_interval: float = 2.0
+    # Сторож зависания: без единого события прогресса дольше этого — воркер
+    # завершает себя `os._exit(1)` (worker.py, Heartbeat.stall_timeout). При ОДНОМ
+    # воркере (обычная топология) просто перестать бить и ждать, пока кто-то другой
+    # позовёт recover_stale, — некого звать, тот же процесс занят и застрял; поэтому
+    # решение жёстче простого молчания — процесс убивает себя сам, `restart:
+    # unless-stopped` в docker-compose.yml поднимает контейнер заново, а задачу
+    # без пульса в БД подбирает recover_stale уже нового процесса.
+    #
+    # 900s (15 минут) — запас поверх самого долгого молчащего этапа с реальным
+    # замером: docs/эксплуатация.md называет ~1 минуту на «отпечатки и кластеризация»
+    # для часовой записи на CPU; запас рассчитан на запись на порядок длиннее
+    # контрольной (до ~15 часов молчания этого этапа) — с большим запасом сверху,
+    # а не впритык к измеренной минуте. Событие прогресса — это и стадии пайплайна,
+    # и каждый мегабайтный чанк при скачивании исходника (Worker._fetch,
+    # storage.py: Storage.download(on_chunk=...)), так что медленный канал сам по
+    # себе не считается зависанием. Не путать с STENOGRAM_STALE_AFTER: тот смотрит
+    # на время с последней записи в БД, этот — на время с последнего события
+    # прогресса; зависание сначала ловит stall_timeout, а стухший в БД пульс —
+    # уже его следствие, которое подбирает recover_stale нового процесса.
+    stall_timeout: float = 900.0
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -97,6 +117,7 @@ class Settings:
             max_attempts=_number(env, "STENOGRAM_MAX_ATTEMPTS", d.max_attempts, int),
             progress_interval=_number(env, "STENOGRAM_PROGRESS_INTERVAL", d.progress_interval),
             poll_interval=_number(env, "STENOGRAM_POLL", d.poll_interval),
+            stall_timeout=_number(env, "STENOGRAM_STALL_TIMEOUT", d.stall_timeout),
         )
 
     @property

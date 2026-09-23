@@ -403,6 +403,74 @@ def test_heartbeat_runs_during_silent_stage(env):
     assert len(seen) >= 3
 
 
+class _FakeHeartbeatStore:
+    """Достаточно для Heartbeat напрямую: только heartbeat(), без остальной JobStore."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def heartbeat(self, job_id, lease):
+        self.calls += 1
+        return True
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_heartbeat_class_calls_os_exit_after_stall_timeout_without_progress(monkeypatch):
+    """Сторож зависания — юнит-тест самого Heartbeat, без пайплайна и БД: молчание
+    ДОЛЬШЕ stall_timeout (ни одного mark_progress()) не просто гасит пульс — зовёт
+    os._exit(1). При одном воркере recover_stale некому позвать, пока тот же
+    процесс сам застрял в обработке этой же задачи: просто замолчать и ждать
+    здесь бесполезно, нужен жёсткий выход. os._exit подменяем на исключение,
+    останавливающее только поток пульса, — иначе тест убил бы сам себя. SystemExit
+    из чужого потока pytest честно репортит как предупреждение (не поток теста
+    его поднял) — filterwarnings на тесте гасит именно и только его.
+    Таймаут ffmpeg subprocess.run — отдельная задача, сторож его не лечит."""
+    store = _FakeHeartbeatStore()
+    job = SimpleNamespace(id="job-1", lease="lease-1")
+    beats: list[int] = []
+    exits: list[int] = []
+
+    def fake_exit(code):
+        exits.append(code)
+        raise SystemExit(code)  # останавливает только этот поток, не процесс теста
+
+    monkeypatch.setattr(worker.os, "_exit", fake_exit)
+    hb = worker.Heartbeat(store, job, interval=0.02, on_beat=lambda: beats.append(1), stall_timeout=0.005)
+
+    with hb:
+        time.sleep(0.08)  # первый же такт (0.02) уже дольше stall_timeout=0.005
+
+    assert hb.stalled.is_set()
+    assert exits == [1]  # именно один раз: реальный os._exit тоже не вернулся бы
+    assert store.calls == 0
+    assert beats == []
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_worker_process_wires_settings_stall_timeout_into_heartbeat_and_calls_exit(env, monkeypatch):
+    """Интеграционно: Settings.stall_timeout доходит до Heartbeat при обработке
+    настоящей задачи через Worker.process(), и сторож реально зовёт os._exit —
+    не только в изолированном юнит-тесте выше."""
+    env.worker.settings = dataclasses.replace(env.worker.settings, stall_timeout=0.02, heartbeat_interval=0.01)
+    exits: list[int] = []
+
+    def fake_exit(code):
+        exits.append(code)
+        raise SystemExit(code)
+
+    monkeypatch.setattr(worker.os, "_exit", fake_exit)
+    _submit(env)
+
+    def hook(progress):
+        time.sleep(0.1)  # дольше stall_timeout=0.02 — ни одного progress-события
+
+    env.run.hook = hook
+
+    env.worker.serve(once=True)
+
+    assert exits == [1]
+
+
 def test_progress_is_throttled_but_stage_changes_are_written(env, monkeypatch):
     now = [100.0]
     env.worker.clock = lambda: now[0]
@@ -500,6 +568,66 @@ def test_nothing_large_survives_a_job(env, monkeypatch):
 # --- старт процесса ------------------------------------------------------------------
 
 
+def test_workspace_creates_missing_root(tmp_path):
+    """STENOGRAM_WORKDIR обычно указывает на свежий docker-том (docker-compose.yml),
+    а не на каталог, который кто-то создал заранее, — регресс, пойманный на сквозной
+    приёмке: первый запуск падал на открытии lock-файла в несуществующей директории."""
+    root = tmp_path / "does" / "not" / "exist"
+
+    ws = worker.Workspace(root)
+
+    assert root.is_dir()
+    assert ws.path.exists()
+    ws.close()
+
+
+def test_worker_creates_and_removes_alive_file(env):
+    """Файл-пульс для докер-healthcheck (docker-compose.yml): свежесть mtime без
+    доступа к SQLite изнутри контейнера воркера."""
+    assert env.worker._alive_path.exists()
+    assert env.worker._alive_path.parent == env.workdir
+
+    env.worker.close()
+
+    assert not env.worker._alive_path.exists()
+
+
+def test_serve_touches_alive_file_each_idle_cycle(env):
+    mtime_before = env.worker._alive_path.stat().st_mtime_ns
+    env.worker._alive_path.unlink()
+
+    env.worker.serve(once=True)  # очередь пуста — один холостой круг
+
+    assert env.worker._alive_path.exists()
+    assert env.worker._alive_path.stat().st_mtime_ns >= mtime_before
+
+
+def test_heartbeat_touches_alive_file_during_silent_pipeline_stage(env, monkeypatch):
+    """Тот же повод, что у Heartbeat в БД: пайплайн может молчать минутами
+    (отпечатки без progress-событий) — alive-файл обновляется по тику пульса,
+    а не по прогрессу пайплайна, поэтому докер-healthcheck не сочтёт воркера
+    зависшим на длинной тихой стадии."""
+    job_id = _submit(env)
+    touches: list[float] = []
+    real_touch = env.worker._touch_alive
+
+    def spy():
+        touches.append(time.monotonic())
+        real_touch()
+
+    monkeypatch.setattr(env.worker, "_touch_alive", spy)
+
+    def hook(progress):
+        time.sleep(0.2)  # несколько тиков пульса (heartbeat_interval=0.05 в env)
+
+    env.run.hook = hook
+
+    env.worker.serve(once=True)
+
+    assert env.store.get(job_id).status == "done"
+    assert len(touches) >= 3  # старт круга serve + минимум один тик пульса + запись факта
+
+
 def test_sweep_removes_only_dead_workers_dirs(env):
     """Каталог работы может быть общим: удаляется только подкаталог воркера, чья
     блокировка свободна (процесс мёртв), а в нём — запись целиком."""
@@ -507,6 +635,7 @@ def test_sweep_removes_only_dead_workers_dirs(env):
     (dead / "job-x").mkdir(parents=True)
     (dead / "job-x" / f"{SHA}.mp4").write_bytes(DATA)
     (env.workdir / f"{dead.name}.lock").touch()  # файл блокировки есть, держателя нет
+    (env.workdir / f"{dead.name}.alive").touch()  # файл-пульс мёртвого воркера тоже осиротел
     neighbour = worker.Workspace(env.workdir)  # живой сосед со своей блокировкой
     (neighbour.path / "job-y").mkdir()
     unrelated = env.workdir / "чужой-файл.txt"
@@ -516,6 +645,7 @@ def test_sweep_removes_only_dead_workers_dirs(env):
 
     assert removed == [dead]
     assert not dead.exists() and not (env.workdir / f"{dead.name}.lock").exists()
+    assert not (env.workdir / f"{dead.name}.alive").exists()
     assert (neighbour.path / "job-y").exists()
     assert env.worker.workspace.path.exists()  # свой не тронут
     assert unrelated.exists()
@@ -616,6 +746,134 @@ def test_worker_loads_one_model_offline_and_drains_queue(worker_env, monkeypatch
     assert args == ("small",)
     assert kwargs["local_files_only"] is True and kwargs["download_root"] == "/models/whisper"
     assert kwargs["num_threads"] == Settings(threads=0).resolved_threads() >= 1  # не умолчание load_model (8)
+
+
+class _FakeCudaWhisperModel:
+    """Заглушка вместо настоящей WhisperModel(device="cuda") — тест не тянет ни
+    ctranslate2, ни видеокарту. `fails` симулирует «cuBLAS/cuDNN не на LD_LIBRARY_PATH»:
+    в реальности такой отказ приходит именно на первом вызове энкодера, не раньше.
+
+    `resolved_device`, если задан, кладётся в `.model.device` — так настоящая
+    WhisperModel отдаёт устройство, на которое ctranslate2 реально решил встать
+    (важно для STENOGRAM_DEVICE=auto: запрошенное имя и фактическое устройство —
+    разные вещи, worker.main() должен смотреть на второе)."""
+
+    def __init__(self, *, fails: bool = False, resolved_device: str | None = None):
+        self.fails = fails
+        self.calls: list[tuple] = []
+        if resolved_device is not None:
+            self.model = SimpleNamespace(device=resolved_device)
+
+    def transcribe(self, audio, **kwargs):
+        self.calls.append((audio, kwargs))
+        if self.fails:
+            raise RuntimeError("libcublas.so.12: cannot open shared object file: No such file or directory")
+        return iter([]), SimpleNamespace(language="ru", language_probability=1.0, duration=1.0)
+
+
+def test_worker_exits_1_when_cuda_preflight_fails(worker_env, monkeypatch, capsys):
+    """ctranslate2.get_cuda_device_count() видит только драйвер и отвечает 1 даже без
+    LD_LIBRARY_PATH на cuBLAS/cuDNN — отказ приходит только на первом вызове энкодера.
+    Пробное кодирование на старте обязано поймать это раньше первой настоящей задачи."""
+    monkeypatch.setenv("STENOGRAM_DEVICE", "cuda")
+    monkeypatch.setattr(models, "check_all", lambda **k: [])
+    fake_model = _FakeCudaWhisperModel(fails=True)
+    monkeypatch.setattr(asr, "load_model", lambda *a, **k: fake_model)
+
+    assert worker.main(["--once"]) == 1
+
+    err = capsys.readouterr().err
+    assert "CUDA" in err
+    assert "libcublas" in err
+    assert len(fake_model.calls) == 1
+    audio_arg, _ = fake_model.calls[0]
+    assert audio_arg.shape == (16000,)  # секунда тишины на 16 кГц
+    assert audio_arg.dtype == np.float32
+
+
+def test_worker_starts_when_cuda_preflight_succeeds(worker_env, monkeypatch):
+    monkeypatch.setenv("STENOGRAM_DEVICE", "cuda")
+    monkeypatch.setattr(models, "check_all", lambda **k: [])
+    fake_model = _FakeCudaWhisperModel(fails=False)
+    monkeypatch.setattr(asr, "load_model", lambda *a, **k: fake_model)
+
+    assert worker.main(["--once"]) == 0
+
+    assert len(fake_model.calls) == 1
+
+
+def test_worker_skips_cuda_preflight_on_cpu(worker_env, monkeypatch):
+    """device по умолчанию — cpu: пробное кодирование не нужно и не должно стоить
+    времени на каждый старт воркера, который никогда не тронет видеокарту."""
+    monkeypatch.setattr(models, "check_all", lambda **k: [])
+    calls = []
+    monkeypatch.setattr(worker, "cuda_preflight", lambda *a, **k: calls.append(1))
+
+    assert worker.main(["--once"]) == 0
+
+    assert calls == []
+
+
+def test_worker_runs_cuda_preflight_when_auto_resolves_to_cuda(worker_env, monkeypatch, capsys):
+    """STENOGRAM_DEVICE=auto само решает cpu или cuda — worker.main() обязан
+    смотреть на фактическое устройство загруженной модели (model.model.device),
+    а не на запрошенное имя "auto", иначе на auto-железе с картой пробное
+    кодирование не запускалось бы вовсе."""
+    monkeypatch.setenv("STENOGRAM_DEVICE", "auto")
+    monkeypatch.setattr(models, "check_all", lambda **k: [])
+    fake_model = _FakeCudaWhisperModel(fails=True, resolved_device="cuda")
+    monkeypatch.setattr(asr, "load_model", lambda *a, **k: fake_model)
+
+    assert worker.main(["--once"]) == 1
+
+    assert len(fake_model.calls) == 1
+    assert "CUDA" in capsys.readouterr().err
+
+
+def test_worker_skips_cuda_preflight_when_auto_resolves_to_cpu(worker_env, monkeypatch):
+    """auto на машине без карты честно достаётся cpu — пробное кодирование не
+    нужно, ровно как на явном STENOGRAM_DEVICE=cpu."""
+    monkeypatch.setenv("STENOGRAM_DEVICE", "auto")
+    monkeypatch.setattr(models, "check_all", lambda **k: [])
+    fake_model = _FakeCudaWhisperModel(fails=True, resolved_device="cpu")
+    monkeypatch.setattr(asr, "load_model", lambda *a, **k: fake_model)
+
+    assert worker.main(["--once"]) == 0
+
+    assert fake_model.calls == []
+
+
+def test_worker_exits_1_when_cuda_has_no_driver_at_all(worker_env, monkeypatch, capsys):
+    """Регресс со сквозной приёмки: на машине без видеокарты и драйвера вовсе
+    ctranslate2 падает уже внутри WhisperModel(...) — до cuda_preflight дело не
+    доходит. Раньше это был необработанный трейсбек, а не «Воркер не запущен»."""
+    monkeypatch.setenv("STENOGRAM_DEVICE", "cuda")
+    monkeypatch.setattr(models, "check_all", lambda **k: [])
+
+    def boom(*a, **k):
+        raise RuntimeError("CUDA failed with error CUDA driver version is insufficient for CUDA runtime version")
+
+    monkeypatch.setattr(asr, "load_model", boom)
+
+    assert worker.main(["--once"]) == 1
+
+    err = capsys.readouterr().err
+    assert "CUDA" in err
+    assert "driver version is insufficient" in err
+
+
+def test_worker_propagates_load_model_failure_on_cpu(worker_env, monkeypatch):
+    """На cpu отказ загрузки модели — не «CUDA не работает»: наружу как есть, это
+    не та категория проблем, которую worker.main здесь классифицирует."""
+    monkeypatch.setattr(models, "check_all", lambda **k: [])
+
+    def boom(*a, **k):
+        raise MemoryError("не хватило памяти на модель")
+
+    monkeypatch.setattr(asr, "load_model", boom)
+
+    with pytest.raises(MemoryError):
+        worker.main(["--once"])
 
 
 def test_sigterm_through_main_requeues_and_exits(worker_env, monkeypatch, storage, tmp_path):
