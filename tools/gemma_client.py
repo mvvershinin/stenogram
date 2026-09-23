@@ -42,17 +42,20 @@ import time
 import urllib.request
 
 HOST = os.environ.get("STENOGRAM_LLM_HOST", "http://127.0.0.1:11434").rstrip("/")
+# urlopen открывает и file://, а адрес приходит из окружения: схему проверяем один раз здесь.
+if not HOST.startswith(("http://", "https://")):
+    raise ValueError(f"STENOGRAM_LLM_HOST должен начинаться с http:// или https://, получено: {HOST!r}")
 MODEL = "gemma4:12b"
 EMBED_MODEL = "bge-m3"
 
 
 def _post(path, payload, timeout=900):
-    req = urllib.request.Request(
+    req = urllib.request.Request(  # noqa: S310 -- схема HOST проверена при импорте
         HOST + path,
         data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
     )
-    return json.loads(urllib.request.urlopen(req, timeout=timeout).read())
+    return json.loads(urllib.request.urlopen(req, timeout=timeout).read())  # noqa: S310 -- схема HOST проверена при импорте
 
 
 def _stats(d, wall):
@@ -69,8 +72,7 @@ def _stats(d, wall):
     }
 
 
-def ask(prompt, *, system=None, num_ctx=8192, num_predict=600, temperature=0.2,
-        think=False, model=MODEL, metrics=False, timeout=900):
+def ask(prompt, *, system=None, num_ctx=8192, num_predict=600, temperature=0.2, think=False, model=MODEL, metrics=False, timeout=900):
     """Один запрос к модели. Возвращает текст, либо (текст, метрики) при metrics=True.
 
     think=False обязателен: иначе весь бюджет num_predict уходит в размышление,
@@ -96,8 +98,7 @@ def ask(prompt, *, system=None, num_ctx=8192, num_predict=600, temperature=0.2,
     return (text, _stats(d, time.time() - t)) if metrics else text
 
 
-def ask_image(prompt, image_path, *, num_ctx=8192, num_predict=600, temperature=0.2,
-              model=MODEL, metrics=False, timeout=900):
+def ask_image(prompt, image_path, *, num_ctx=8192, num_predict=600, temperature=0.2, model=MODEL, metrics=False, timeout=900):
     """Запрос с картинкой. Точность на мелких деталях низкая — см. предупреждение выше."""
     with open(image_path, "rb") as f:
         img = base64.b64encode(f.read()).decode()
@@ -119,8 +120,7 @@ def ask_image(prompt, image_path, *, num_ctx=8192, num_predict=600, temperature=
     return (text, _stats(d, time.time() - t)) if metrics else text
 
 
-def chat(messages, *, num_ctx=8192, num_predict=600, temperature=0.2,
-         think=False, model=MODEL, timeout=900):
+def chat(messages, *, num_ctx=8192, num_predict=600, temperature=0.2, think=False, model=MODEL, timeout=900):
     """Многоходовой диалог. messages: [{"role": "user"|"assistant", "content": "..."}]"""
     payload = {
         "model": model,
@@ -149,7 +149,7 @@ def embed(texts, *, model=EMBED_MODEL, timeout=600):
 
 def health():
     """Список моделей на хосте. Проверка, что сервис жив."""
-    with urllib.request.urlopen(HOST + "/api/tags", timeout=15) as r:
+    with urllib.request.urlopen(HOST + "/api/tags", timeout=15) as r:  # noqa: S310 -- схема HOST проверена при импорте
         return [m["name"] for m in json.load(r)["models"]]
 
 
