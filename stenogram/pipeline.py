@@ -55,6 +55,38 @@ class Intermediate:
     step: float | None = None
     video_error: str | None = None  # поиск упал: tiles == [] значит «не вышло», а не «подсветки нет»
 
+    def to_dict(self) -> dict:
+        """JSON-совместимый словарь для внешнего кэша. Числа приводятся к int/float явно:
+        numpy-скаляры `json.dumps` не принимает."""
+        return {
+            "segments": [
+                {
+                    "start": float(s.start),
+                    "end": float(s.end),
+                    "text": s.text,
+                    "words": [{"start": float(w.start), "end": float(w.end), "text": w.text} for w in s.words],
+                }
+                for s in self.segments
+            ],
+            "language": self.language,
+            "tiles": None if self.tiles is None else [[int(t.x), int(t.y), int(t.width), int(t.height)] for t in self.tiles],
+            "labels": None if self.labels is None else [int(x) for x in self.labels],
+            "step": None if self.step is None else float(self.step),
+            "video_error": self.video_error,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> Intermediate:
+        """Обратно из `to_dict`. `None` и пустой список у плиток и меток различаются."""
+        return cls(
+            segments=[asr.Segment(s["start"], s["end"], s["text"], [asr.Word(w["start"], w["end"], w["text"]) for w in s["words"]]) for s in data["segments"]],
+            language=data["language"],
+            tiles=None if data["tiles"] is None else [video.Tile(*t) for t in data["tiles"]],
+            labels=None if data["labels"] is None else np.asarray(data["labels"], dtype=int),
+            step=data["step"],
+            video_error=data["video_error"],
+        )
+
 
 @dataclass
 class Result:

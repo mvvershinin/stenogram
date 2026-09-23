@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import dataclasses
 import gc
+import json
 import weakref
 from pathlib import Path
 
@@ -343,3 +344,47 @@ def test_highlight_has_its_own_progress_stage(tmp_path, stages, monkeypatch):
     _run(tmp_path, progress=events.append)
 
     assert pipeline.Event("highlight", "      подсветка плитки 1/2", 0.5) in events
+
+
+@pytest.mark.parametrize(
+    ("tiles", "labels", "step", "video_error"),
+    [
+        # numpy-скаляры в плитках и шаге: json.dumps их не принимает, to_dict обязан привести
+        ([video.Tile(np.int64(10), np.int64(0), np.int64(3), np.int64(20))], np.array([0, -1, 0], dtype=np.int64), np.float32(0.2), None),
+        (None, None, None, None),  # плитки не искали
+        ([], None, None, "не читается поток"),  # искали и упали — причина переживает кэш
+        (_TILES, np.empty(0, dtype=int), 0.2, None),  # пустые метки — не то же, что их отсутствие
+    ],
+)
+def test_intermediate_survives_json_round_trip(tiles, labels, step, video_error):
+    """Кэш сервиса лежит в S3 как JSON: всё, что различает `run`, должно пережить
+    `json.dumps` → `json.loads` → `from_dict` без потерь."""
+    words = [Word(np.float64(0.5), np.float64(0.9), " Добрый"), Word(1.0, 1.4, " день")]
+    original = pipeline.Intermediate([Segment(0.5, 1.4, "Добрый день", words)], "ru", tiles, labels, step, video_error)
+
+    restored = pipeline.Intermediate.from_dict(json.loads(json.dumps(original.to_dict())))
+
+    assert restored.segments == original.segments
+    assert restored.language == "ru"
+    assert restored.tiles == tiles
+    assert restored.video_error == video_error
+    if labels is None:
+        assert restored.labels is None
+    else:
+        assert isinstance(restored.labels, np.ndarray)
+        assert np.array_equal(restored.labels, labels)
+    assert restored.step == (None if step is None else pytest.approx(float(step)))
+
+
+def test_rerun_from_json_cache_matches_rerun_from_memory(tmp_path, stages, monkeypatch):
+    """То, что сервис достанет из S3, годится для `reuse` так же, как объект в памяти."""
+    first = _run(tmp_path)
+    for module, name in ((audio, "extract_wav"), (video, "find_tiles"), (asr, "transcribe"), (video, "active_speaker")):
+        monkeypatch.setattr(module, name, _boom)
+    cached = pipeline.Intermediate.from_dict(json.loads(json.dumps(first.intermediate.to_dict())))
+    opts = pipeline.Options(tile_speakers=[1, 1])
+
+    from_memory = pipeline.run(None, tmp_path / "audio16k.wav", opts, reuse=first.intermediate)
+    from_json = pipeline.run(None, tmp_path / "audio16k.wav", opts, reuse=cached)
+
+    assert from_json.utterances == from_memory.utterances

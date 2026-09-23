@@ -99,6 +99,58 @@ jobs:
           fi
           exit "$code"
 
+  # Тесты сервиса (service/ — отдельный дистрибутив stenogram-service). Корневой pytest
+  # их не собирает (testpaths = ["tests"]): без minio они бы не импортировались.
+  # Без сети и моделей: хранилище в памяти, SQLite во временном каталоге.
+  service:
+    name: service (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            service/pyproject.toml
+
+      - name: Установить ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          # Звук кэша сжимается во FLAC через ffmpeg; без бинарника эти тесты молча
+          # пропустились бы, а static-ffmpeg полез бы за ним в сеть посреди теста.
+          for bin in ffmpeg ffprobe; do
+            if ! "$bin" -version >/dev/null 2>&1; then
+              echo "::error::$bin недоступен после apt-get — тесты с маркером «ffmpeg» молча пропустились бы."
+              exit 1
+            fi
+          done
+
+      - name: Установить пакет и сервис
+        run: |
+          python -m pip install --upgrade pip
+          # Вместе: имени stenogram на PyPI нет, зависимость сервиса берётся из корня.
+          pip install -e . -e "./service[dev]"
+
+      - name: Тесты сервиса
+        working-directory: service
+        run: |
+          code=0
+          pytest || code=$?
+          if [ "$code" -eq 5 ]; then
+            echo "::error::pytest вернул код 5 — «no tests collected» в service/tests. Зелёный бейдж на пустом наборе лгал бы."
+          fi
+          exit "$code"
+
   # Дымовой тест установки: единственная проверка, что дерево зависимостей резолвится
   # сегодняшними границами версий из pyproject.toml, плюс регресс-тест на отложенные
   # тяжёлые импорты (--help обязан отработать за доли секунды). Моделей и записей нет —

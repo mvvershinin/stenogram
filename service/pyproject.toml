@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stenogram-service"
+version = "0.1.0"
+description = "REST-декодер стенограмм поверх пакета stenogram: очередь задач, S3, кэш"
+requires-python = ">=3.10"
+license = "MIT"
+
+# S3 и очередь живут здесь, а не в пакете stenogram: пакет остаётся офлайн-инструментом
+# без сетевых зависимостей. Имени «stenogram» на PyPI нет — ставить вместе с корнем:
+# `pip install -e . -e ./service[dev]`.
+dependencies = [
+    "stenogram",
+    "minio>=7.2,<8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.6,<0.16",
+    "pytest>=8",
+]
+
+[tool.setuptools]
+packages = ["stenogram_service"]
+
+# Секции [tool.ruff] здесь нет намеренно: иначе она заменит корневую настройку для service/.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--strict-markers"]
+markers = [
+    "ffmpeg: нужен бинарник ffmpeg (сжатие звука кэша во FLAC), секунды",
+]

@@ -63,7 +63,8 @@ again = pipeline.run(None, wav, pipeline.Options(tile_speakers=[3, 1]), reuse=re
 
 `Intermediate` — `segments`, `language`, `tiles` (`None` — не искали, `[]` — искали и не
 нашли), `labels` и `step` — метки подсветки, `video_error` — причина, если `tiles == []`
-из-за упавшего поиска.
+из-за упавшего поиска. `to_dict()` / `Intermediate.from_dict(d)` — перевод в JSON-совместимый
+словарь и обратно, для внешнего кэша.
 
 ---
 
