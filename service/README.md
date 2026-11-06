@@ -82,6 +82,29 @@ healthcheck) идёт по расписанию независимо от про
 уже нет. Таймаут на `subprocess.run` ffmpeg внутри пайплайна сторож не
 заменяет — это отдельная задача, здесь не трогали.
 
+## Стенд в локальной сети
+
+Сервис на машине с картой, запись на другом компьютере. На сервере в `.env` добавить:
+
+```bash
+COMPOSE_FILE=docker-compose.yml:docker-compose.lan.yml
+COMPOSE_PROFILES=gpu
+STENOGRAM_THREADS=12    # разметке достаётся половина: на 6 ядрах это все 6
+```
+
+`docker compose up -d --build` выполняется один раз. Дальше контейнеры поднимает сам
+Docker при загрузке машины (`restart: unless-stopped`).
+
+На своём компьютере положить в `~/.config/stenogram/remote.env` адрес и ключи
+(`STENOGRAM_HOST`, `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD`) и запускать:
+
+```bash
+service/transcribe.sh запись.mp3
+```
+
+Стенограмма появляется рядом с записью: `запись.txt` и `запись.blocks.json`. Нужны `curl`
+и `jq`. API и MinIO открыты всей локальной сети, API без авторизации.
+
 ## Пример: POST → GET → rerun
 
 Файл сперва должен лежать в MinIO (`mc cp`, консоль на `:9001`, или SDK). Дальше:

@@ -1,0 +1,15 @@
+# Стенд на отдельной машине в локальной сети: запись заливается в MinIO с другого
+# компьютера (service/transcribe.sh). К docker-compose.yml подключается через
+# COMPOSE_FILE в .env. edge — та же сеть без исходящего NAT, что у api: порт
+# публикуется, а выхода в интернет у контейнера нет.
+services:
+  minio:
+    networks: [internal, edge]
+    ports:
+      - "${STENOGRAM_S3_PORT:-9000}:9000"
+
+  # pipeline.run отдаёт разметке половину потоков. Карта занята только распознаванием,
+  # поэтому разметке достаются все ядра.
+  worker-cuda:
+    environment:
+      STENOGRAM_THREADS: ${STENOGRAM_THREADS:-0}

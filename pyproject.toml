@@ -19,6 +19,7 @@ license = "MIT"
 
 dependencies = [
     "faster-whisper>=1.1.0,<2",
+    "av>=11,<19",  # faster-whisper 1.2.1 зовёт av.open(metadata_errors=...), в av 19 параметра нет: падает на любом файле
     "sherpa-onnx>=1.10.0,<2",
     "scikit-learn>=1.4,<2",
     "numpy>=1.24,<3",
