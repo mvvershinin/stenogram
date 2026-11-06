@@ -207,3 +207,11 @@ def test_422_does_not_echo_request_body(client):
     assert response.status_code == 422
     assert "Петров" not in response.text
     assert response.json()["detail"][0]["loc"] == ["body", "speakers"]
+
+
+def test_denoise_reaches_pipeline_options():
+    from stenogram_service.params import JobParams
+
+    options = JobParams(denoise=True).options(model="small", device="cpu", compute_type="int8", threads=1)
+    assert options.denoise is True
+    assert JobParams().options(model="small", device="cpu", compute_type="int8", threads=1).denoise is False

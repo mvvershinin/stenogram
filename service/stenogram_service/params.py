@@ -48,6 +48,7 @@ class JobParams(BaseModel):
     names: Names | None = None
     video: Annotated[bool, Field(strict=True)] = _DEFAULTS.video
     diarization: Annotated[bool, Field(strict=True)] = _DEFAULTS.diarization
+    denoise: Annotated[bool, Field(strict=True)] = _DEFAULTS.denoise
     highlight_lag: Lag = _DEFAULTS.highlight_lag
 
     def names_by_index(self) -> dict[int, str]:
@@ -63,6 +64,7 @@ class JobParams(BaseModel):
             compute_type=compute_type,
             threads=threads,
             diarization=self.diarization,
+            denoise=self.denoise,
             video=self.video,
             speakers=self.speakers,
             max_speakers=self.max_speakers,

@@ -26,8 +26,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
 
 WORKDIR /app
 
-# Сначала только метаданные пакетов — слой с зависимостями кэшируется, пока не
-# меняются pyproject.toml; исходники правятся значительно чаще зависимостей.
+# Правка кода сбрасывает кэш слоя и запускает pip заново. Скачанные пакеты при этом
+# не пропадают: они лежат в постоянном кэше BuildKit (--mount=type=cache ниже), поэтому
+# пересборка не качает 1.4 ГБ CUDA-библиотек ещё раз. Не HOME-каталог pip: в стадии
+# cuda HOME уже указывает на stenogram, и кэш разъехался бы на два.
 COPY pyproject.toml README.md ./
 COPY service/pyproject.toml ./service/pyproject.toml
 COPY stenogram ./stenogram
@@ -35,7 +37,7 @@ COPY service/stenogram_service ./service/stenogram_service
 
 # Корень — обычная зависимость сервиса (имени «stenogram» на PyPI нет, ставится из
 # исходников рядом). Без dev-экстры: ruff, pytest, httpx в образе не нужны.
-RUN pip install --no-cache-dir . ./service
+RUN --mount=type=cache,target=/pip-cache PIP_CACHE_DIR=/pip-cache pip install . ./service
 
 # Непривилегированный пользователь с фиксированным UID/GID 1000 — чтобы владелец
 # именованных томов (/data), которые Docker засевает содержимым этого каталога из
@@ -86,7 +88,7 @@ USER root
 # Версии не пины `==`, а диапазоны major: cuBLAS/cuDNN здесь — рантайм-библиотеки
 # под конкретную установленную CUDA/cuDNN на карте, а не то, что резолвится вместе
 # с ctranslate2 (см. предупреждение выше) — жёсткий пин молчаливо бы устарел.
-RUN pip install --no-cache-dir "nvidia-cublas-cu12>=12,<13" "nvidia-cudnn-cu12>=9,<10"
+RUN --mount=type=cache,target=/pip-cache PIP_CACHE_DIR=/pip-cache pip install "nvidia-cublas-cu12>=12,<13" "nvidia-cudnn-cu12>=9,<10"
 USER stenogram
 ENV LD_LIBRARY_PATH=/usr/local/lib/python3.12/site-packages/nvidia/cublas/lib:/usr/local/lib/python3.12/site-packages/nvidia/cudnn/lib
 CMD ["python", "-m", "stenogram_service.worker"]
