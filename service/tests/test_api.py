@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from stenogram_service.api import create_app
 from stenogram_service.config import Settings
 from stenogram_service.jobstore import SqliteJobStore
+from stenogram_service.params import JobParams
 
 SOURCE = "s3://records/заседания/Петров_А40-12345-2026.mp4"
 
@@ -210,8 +211,6 @@ def test_422_does_not_echo_request_body(client):
 
 
 def test_denoise_reaches_pipeline_options():
-    from stenogram_service.params import JobParams
-
     options = JobParams(denoise=True).options(model="small", device="cpu", compute_type="int8", threads=1)
     assert options.denoise is True
     assert JobParams().options(model="small", device="cpu", compute_type="int8", threads=1).denoise is False
