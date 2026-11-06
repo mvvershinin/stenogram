@@ -34,10 +34,8 @@ main() тестируется без единого настоящего мед�
 Исключений два. Фикстура `fake_pipeline` прогоняет main() насквозь, подменяя
 только то, что требует ffmpeg/ONNX/сети, — середина (video.to_turns,
 diarization.diarize_with_video, align.assign, render.write) работает
-по-настоящему, иначе тупик с --tile-speakers не воспроизвести. И тест
-test_main_generic_handler_preserves_multiline_message... помечен
-@pytest.mark.ffmpeg и прогоняет настоящий audio.extract_wav на синтетическом
-видео без звуковой дорожки — реальный первый триггер общего перехватчика.
+по-настоящему, иначе тупик с --tile-speakers не воспроизвести. Настоящий audio.extract_wav на синтетическом
+видео без звуковой дорожки прогоняет tests/integration/test_ffmpeg.py — реальный первый триггер общего перехватчика.
 """
 
 from __future__ import annotations
@@ -617,8 +615,7 @@ def test_main_generic_handler_catches_expected_exceptions_without_traceback(tmp_
     строка, не трейсбек») — она зеленела ТОЛЬКО потому, что все
     параметризованные исключения были однострочными: тест проверял не то,
     что заявлено в названии. Настоящий первый триггер общего перехватчика
-    (см. test_main_generic_handler_preserves_multiline_message_on_real_trigger
-    ниже) даёт четырёхстрочное сообщение — audio.extract_wav вкладывает
+    (см. test_main_keeps_multiline_ffmpeg_error_whole ниже) даёт четырёхстрочное сообщение — audio.extract_wav вкладывает
     stderr ffmpeg целиком. Перехватчик не обязан схлопывать сообщение в
     одну строку — обязан только не превращать его в трейсбек и не терять
     исходный текст. Здесь проверяется именно это: сообщение сохранено
@@ -858,26 +855,20 @@ def test_main_broken_pipe_on_final_block_is_handled_not_left_to_interpreter(fake
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.ffmpeg
-def test_main_generic_handler_preserves_multiline_message_on_real_trigger(tmp_path, ffmpeg_bin, capsys):
-    """Воспроизводит буквально «настоящий первый триггер» из находки ревью:
-    видео без звуковой дорожки. audio.extract_wav не замокан — вызывается
-    по-настоящему, на настоящем (синтетическом, без единой настоящей
-    записи) видео. Сообщение реально состоит из четырёх строк: обёртка
-    "ffmpeg не смог извлечь аудио из ...:" плюс три строки stderr самого
-    ffmpeg. Перехватчик обязан пропустить их как есть (без трейсбека), а не
-    схлопнуть в одну строку и не потерять текст."""
-    ffmpeg, _ = ffmpeg_bin
-    video_no_audio = tmp_path / "без_звука.mp4"
-    subprocess.run(
-        [ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=5:duration=1", "-pix_fmt", "yuv420p", str(video_no_audio)],
-        check=True,
-    )
+def test_main_keeps_multiline_ffmpeg_error_whole(tmp_path, monkeypatch, capsys):
+    """audio.extract_wav вкладывает stderr ffmpeg целиком, и он многострочный. Перехватчик
+    обязан выдать его как есть, без трейсбека. ffmpeg подменён; то же на настоящем ffmpeg —
+    tests/integration/test_ffmpeg.py."""
+    source = tmp_path / "без_звука.mp4"
+    source.write_bytes(b"")
+    stderr = "Output file does not contain any stream\nError opening output files\nConversion failed!"
+    monkeypatch.setattr(audio, "find_ffmpeg", lambda: ("ffmpeg", "ffprobe"))
+    monkeypatch.setattr(audio.subprocess, "run", lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 1, "", stderr))
 
-    code = cli.main([str(video_no_audio)])
+    code = cli.main([str(source)])
     err = capsys.readouterr().err
 
     assert code == 1
     assert err.startswith("Ошибка: ffmpeg не смог извлечь аудио")
+    assert stderr in err
     assert "Traceback" not in err
-    assert err.count("\n") > 1  # настоящее сообщение МНОГОстрочное — это нормальное поведение, не трейсбек

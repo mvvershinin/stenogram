@@ -46,8 +46,8 @@ jobs:
 
   # Тесты на матрице Python. Распознавание в CI не гоняем — ни моделей, ни записей здесь
   # нет и не будет; "slow"-тесты (ONNX/faster-whisper, сеть) исключены маркером.
-  # Тесты с настоящим ffmpeg тоже: установка через apt время от времени висела 30 минут.
-  # Их запускают локально: pytest -m ffmpeg, в корне и в service/.
+  # Внешние зависимости в тестах подменены. Интеграционные тесты лежат в tests/integration
+  # и в CI не входят: установка ffmpeg через apt время от времени висела 30 минут.
   test:
     name: test (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
@@ -71,14 +71,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
-      - name: Тесты (pytest -m "not slow and not ffmpeg")
+      - name: Тесты (pytest -m "not slow")
         run: |
           # Условие честности: пустой набор тестов даёт код 5 ("no tests collected").
           # Джоба обязана остаться красной в этом случае, а не превратиться в зелёный
           # бейдж, как будто что-то было проверено, — поэтому код 5 отдельно распознаётся
           # и явно объясняется, а не проглатывается.
           code=0
-          pytest -m "not slow and not ffmpeg" || code=$?
+          pytest -m "not slow" || code=$?
           if [ "$code" -eq 5 ]; then
             echo "::error::pytest вернул код 5 — «no tests collected»: в tests/ ещё нет ни одного теста (раздел 5 плана публикации, .docs/plans/2026-08-25_публикация.md). Джоба намеренно красная: зелёный бейдж на пустом наборе тестов лгал бы сильнее, чем его отсутствие."
           fi
@@ -117,7 +117,7 @@ jobs:
         working-directory: service
         run: |
           code=0
-          pytest -m "not ffmpeg" || code=$?
+          pytest || code=$?
           if [ "$code" -eq 5 ]; then
             echo "::error::pytest вернул код 5 — «no tests collected» в service/tests. Зелёный бейдж на пустом наборе лгал бы."
           fi

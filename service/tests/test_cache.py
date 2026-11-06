@@ -13,12 +13,12 @@ from __future__ import annotations
 import dataclasses
 import importlib.metadata
 import json
+import shutil
 import subprocess
 import sys
 
 import numpy as np
 import pytest
-from fakes import write_tone
 
 import stenogram
 from stenogram import audio, models, pipeline
@@ -151,43 +151,6 @@ def store(storage) -> cache.Cache:
     return cache.Cache(storage, "cache-bucket", "svc/")
 
 
-@pytest.mark.ffmpeg
-def test_intermediate_round_trip_is_lossless(tmp_path, storage, store):
-    wav = write_tone(tmp_path / "audio16k.wav")
-    store.put_intermediate("r1", _intermediate(), wav)
-
-    assert storage.writes == [Location("cache-bucket", "svc/asr/r1/audio16k.flac"), Location("cache-bucket", "svc/asr/r1/intermediate.json")]
-    assert storage.content_types[storage.writes[0]] == "audio/flac"
-    assert len(storage.objects[storage.writes[0]]) < wav.stat().st_size
-
-    restored_wav = tmp_path / "restored.wav"
-    restored = store.get_intermediate("r1", restored_wav)
-
-    assert restored.segments == _intermediate().segments
-    assert restored.tiles == _intermediate().tiles
-    assert np.array_equal(restored.labels, _intermediate().labels)
-    assert np.array_equal(audio.load_wav(restored_wav), audio.load_wav(wav))  # отсчёт в отсчёт
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["audio16k.wav", "restored.wav"]  # временные убраны
-
-
-@pytest.mark.ffmpeg
-def test_cached_audio_carries_no_source_metadata(tmp_path, storage, store):
-    """extract_wav переносит теги исходника в WAV; в кэш они попасть не должны."""
-    ffmpeg, ffprobe = audio.find_ffmpeg()
-    tone = write_tone(tmp_path / "tone.wav")
-    tagged = tmp_path / "tagged.wav"
-    subprocess.run([ffmpeg, "-y", "-v", "error", "-i", str(tone), "-metadata", "title=Петров А40-12345", "-c:a", "pcm_s16le", str(tagged)], check=True)
-    assert "Петров" in subprocess.run([ffprobe, "-v", "error", "-show_format", str(tagged)], capture_output=True, text=True).stdout
-
-    store.put_intermediate("r1", _intermediate(), tagged)
-    flac = tmp_path / "cached.flac"
-    flac.write_bytes(storage.objects[store.audio_location("r1")])
-
-    probe = subprocess.run([ffprobe, "-v", "error", "-show_format", "-show_streams", str(flac)], capture_output=True, text=True, check=True).stdout
-    assert "Петров" not in probe
-    assert "А40" not in probe
-
-
 def test_missing_intermediate_is_a_miss(tmp_path, store):
     assert store.get_intermediate("нет", tmp_path / "a.wav") is None
 
@@ -248,15 +211,6 @@ def test_result_cache_refuses_per_job_fields(storage, store, personal):
     assert storage.writes == []
 
 
-@pytest.mark.ffmpeg
-def test_corrupt_cached_audio_is_a_miss(tmp_path, storage, store):
-    storage.put_json(store.intermediate_location("r1"), _intermediate().to_dict())
-    storage.put_bytes(store.audio_location("r1"), b"not a flac at all")
-
-    assert store.get_intermediate("r1", tmp_path / "a.wav") is None
-    assert not (tmp_path / "a.wav").exists()
-
-
 def test_video_fallback_result_is_not_cached(storage, store):
     """Разметка откатилась на голос из-за временного отказа видео — тот же ключ
     в следующий раз должен получить шанс на разметку по видео."""
@@ -306,3 +260,62 @@ def test_result_meta_is_written_before_blocks(storage, store):
     assert storage.writes == [store.text_location("k1"), store.meta_location("k1"), store.blocks_location("k1")]
     assert store.get_meta("k1") == meta
     assert store.get_meta("нет") is None
+
+
+# ---------------------------------------------------------------------------
+# Звук в кэше: ffmpeg подменён. На настоящем ffmpeg —
+# service/tests/integration/test_cache_ffmpeg.py.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fake_ffmpeg(monkeypatch):
+    """Вместо перекодирования копирует вход в выход и запоминает команды."""
+    commands: list[list[str]] = []
+
+    def run(cmd, **kwargs):
+        commands.append(cmd)
+        shutil.copy(cmd[cmd.index("-i") + 1], cmd[-1])
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(audio, "find_ffmpeg", lambda: ("ffmpeg", "ffprobe"))
+    monkeypatch.setattr(cache.subprocess, "run", run)
+    return commands
+
+
+def test_intermediate_round_trip(tmp_path, storage, store, fake_ffmpeg):
+    wav = tmp_path / "audio16k.wav"
+    wav.write_bytes(b"sound")
+
+    store.put_intermediate("r1", _intermediate(), wav)
+    restored_wav = tmp_path / "restored.wav"
+    restored = store.get_intermediate("r1", restored_wav)
+
+    assert storage.writes == [Location("cache-bucket", "svc/asr/r1/audio16k.flac"), Location("cache-bucket", "svc/asr/r1/intermediate.json")]
+    assert storage.content_types[storage.writes[0]] == "audio/flac"
+    assert restored.segments == _intermediate().segments
+    assert restored_wav.read_bytes() == b"sound"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["audio16k.wav", "restored.wav"]  # временные убраны
+
+
+def test_cached_audio_is_written_without_source_metadata(tmp_path, store, fake_ffmpeg):
+    """Теги исходника могут содержать имена из дела: ffmpeg по умолчанию их переносит."""
+    wav = tmp_path / "audio16k.wav"
+    wav.write_bytes(b"sound")
+
+    store.put_intermediate("r1", _intermediate(), wav)
+    store.get_intermediate("r1", tmp_path / "restored.wav")
+
+    assert len(fake_ffmpeg) == 2
+    for cmd in fake_ffmpeg:
+        assert cmd[cmd.index("-map_metadata") + 1] == "-1"
+
+
+def test_undecodable_cached_audio_is_a_miss(tmp_path, storage, store, monkeypatch):
+    storage.put_json(store.intermediate_location("r1"), _intermediate().to_dict())
+    storage.put_bytes(store.audio_location("r1"), b"not a flac at all")
+    monkeypatch.setattr(audio, "find_ffmpeg", lambda: ("ffmpeg", "ffprobe"))
+    monkeypatch.setattr(cache.subprocess, "run", lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 1, "", "Invalid data"))
+
+    assert store.get_intermediate("r1", tmp_path / "a.wav") is None
+    assert not (tmp_path / "a.wav").exists()

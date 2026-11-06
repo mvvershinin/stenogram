@@ -7,7 +7,7 @@ stdlib `wave` (без ffmpeg вообще), видео — через ffmpeg lav
 
 Тесты, помеченные `@pytest.mark.ffmpeg`, автоматически пропускаются, если
 `stenogram.audio.find_ffmpeg()` не может найти ни системный ffmpeg, ни
-пакет `static-ffmpeg` — CI без ffmpeg не должен краснеть на этом маркере.
+пакет `static-ffmpeg`. Такие тесты лежат в tests/integration и в CI не входят.
 """
 
 from __future__ import annotations

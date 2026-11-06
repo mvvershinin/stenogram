@@ -44,11 +44,13 @@ version = { attr = "stenogram.__version__" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Интеграционные тесты не входят в обычный запуск: pytest tests/integration
+norecursedirs = ["integration"]
 # Опечатка вида @pytest.mark.ffmepg иначе тихо отключает автоскип из conftest.py —
 # тест просто покраснеет на машине без ffmpeg вместо ожидаемого skip.
 addopts = ["--strict-markers"]
 markers = [
-    "ffmpeg: нужен бинарник ffmpeg, но быстро — секунды",
+    "ffmpeg: интеграционный тест на настоящем ffmpeg, секунды",
     "slow: ONNX-модели или faster-whisper, сеть, минуты",
 ]
 

@@ -33,6 +33,8 @@ packages = ["stenogram_service"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Интеграционные тесты не входят в обычный запуск: pytest tests/integration
+norecursedirs = ["integration"]
 addopts = ["--strict-markers"]
 markers = [
     "ffmpeg: нужен бинарник ffmpeg (сжатие звука кэша во FLAC), секунды",
