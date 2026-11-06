@@ -1,0 +1,58 @@
+# Локальное хранилище MinIO. Подключается через COMPOSE_FILE в .env. Для другого
+# S3-совместимого хранилища этот файл не нужен, см. service/README.md.
+#
+# Образы из этого файла больше не скачиваются с quay.io и Docker Hub (проверено 06.11.2026):
+# нужна готовая копия, перенесённая через docker save / docker load.
+
+networks:
+  storage:
+    internal: true
+
+volumes:
+  minio-data:
+
+services:
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-04-08T15-41-24Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${STENOGRAM_S3_ACCESS_KEY:?задайте в .env}
+      MINIO_ROOT_PASSWORD: ${STENOGRAM_S3_SECRET_KEY:?задайте в .env}
+    volumes:
+      - minio-data:/data
+    networks: [storage]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # Разовая настройка: бакет создаётся при первом поднятии стенда и не пересоздаётся —
+  # `--ignore-existing`. Завершается кодом 0 и выходит, `docker compose up` не виснет
+  # на нём (condition: service_completed_successfully у зависимых).
+  minio-init:
+    image: quay.io/minio/mc:RELEASE.2025-04-08T15-39-49Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    networks: [storage]
+    environment:
+      MINIO_ROOT_USER: ${STENOGRAM_S3_ACCESS_KEY:?задайте в .env}
+      MINIO_ROOT_PASSWORD: ${STENOGRAM_S3_SECRET_KEY:?задайте в .env}
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 \"$$MINIO_ROOT_USER\" \"$$MINIO_ROOT_PASSWORD\" &&
+      mc mb --ignore-existing local/${STENOGRAM_S3_BUCKET:-stenogram}
+      "
+
+  worker:
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+
+  worker-cuda:
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully

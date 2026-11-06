@@ -221,8 +221,8 @@ Ctrl+C остаётся Ctrl+C (код 130), а `... | head` — штатным 
 стенограмма возвращается и ложится рядом с записью. На машине с картой работает REST-сервис
 в Docker, он поднимается сам при её включении. Запись 102 минуты считается 6–9 минут.
 
-Запись уходит на эту машину и остаётся в её хранилище, так что офлайн здесь значит
-«внутри своей сети». API и хранилище открыты всей локальной сети, API без авторизации.
+Запись уходит в S3-хранилище сервиса и остаётся там. С локальным MinIO это значит «внутри
+своей сети», с облачным S3 запись покидает её. API открыт всей локальной сети без авторизации.
 
 ### Сборка и запуск на машине с картой
 
@@ -244,8 +244,7 @@ cd stenogram
 ./venv/bin/python -m stenogram.models --fetch --whisper large-v3-turbo
 ```
 
-**3. Настроить.** В `service/.env` пропишите пароль хранилища не короче 8 символов и
-абсолютные пути к моделям:
+**3. Настроить.** В `service/.env` пропишите пароль хранилища и абсолютные пути к моделям:
 
 ```bash
 cd service
@@ -253,23 +252,43 @@ cp .env.example .env
 ```
 
 ```bash
-MINIO_ROOT_PASSWORD=придумайте-пароль
+STENOGRAM_S3_SECRET_KEY=придумайте-пароль-от-8-символов
 STENOGRAM_MODELS_DIR=/home/вы/.cache/stenogram
 STENOGRAM_WHISPER_MODELS_DIR=/home/вы/.cache/huggingface/hub
 ```
 
-И добавьте туда же три строки: сервис на карте, доступ из локальной сети, все ядра на
-разметку участников (укажите удвоенное число ядер):
+И добавьте туда же две строки: сервис на карте и все ядра на разметку участников (укажите
+удвоенное число ядер):
 
 ```bash
-COMPOSE_FILE=docker-compose.yml:docker-compose.lan.yml
 COMPOSE_PROFILES=gpu
 STENOGRAM_THREADS=12
 ```
 
-**4. Образы MinIO.** Образы из `docker-compose.yml` больше не скачиваются с `quay.io` и
-Docker Hub (проверено 06.11.2026), поэтому следующий шаг без них упадёт. Если они есть
-на другой машине, перенесите их:
+**4. Выбрать хранилище.** Записи и результаты лежат в S3. Подходит **любое S3-совместимое
+хранилище**: своё или облачное, MinIO в комплекте не обязателен.
+
+*Своё S3.* MinIO не запускается и не нужен. Бакет создайте заранее, а в `.env` замените
+блок хранилища:
+
+```bash
+COMPOSE_FILE=docker-compose.yml
+STENOGRAM_S3_ENDPOINT=s3.example.com
+STENOGRAM_S3_SECURE=true
+STENOGRAM_S3_REGION=us-east-1
+STENOGRAM_S3_ACCESS_KEY=ваш-ключ
+STENOGRAM_S3_SECRET_KEY=ваш-секрет
+```
+
+*Локальный MinIO.* Он живёт в отдельном файле `docker-compose.minio.yml` и включён в
+`.env.example`. Чтобы заливать записи с другого компьютера, задайте:
+
+```bash
+COMPOSE_FILE=docker-compose.yml:docker-compose.minio.yml:docker-compose.lan.yml
+```
+
+Образы MinIO больше не скачиваются с `quay.io` и Docker Hub (проверено 06.11.2026). Если
+они есть на другой машине, перенесите их до следующего шага:
 
 ```bash
 docker save quay.io/minio/minio:RELEASE.2025-04-08T15-41-24Z \
@@ -289,14 +308,18 @@ curl localhost:8000/healthz    # {"status":"ok"}
 
 ### Запуск расшифровки со своего компьютера
 
-Нужны `curl`, `jq` и клон этого репозитория. Один раз положите адрес и пароль в
+Нужны `curl`, `jq` и клон этого репозитория. Один раз положите адреса и ключи в
 `~/.config/stenogram/remote.env`:
 
 ```bash
-STENOGRAM_HOST=адрес-машины
-MINIO_ROOT_USER=stenogram
-MINIO_ROOT_PASSWORD=тот-же-пароль
+STENOGRAM_API=http://адрес-машины:8000
+STENOGRAM_S3_URL=http://адрес-машины:9000
+STENOGRAM_S3_ACCESS_KEY=stenogram
+STENOGRAM_S3_SECRET_KEY=тот-же-пароль
 ```
+
+Для своего S3 укажите его адрес и ключи, а также `STENOGRAM_S3_BUCKET` и
+`STENOGRAM_S3_REGION`, если они отличаются от `stenogram` и `us-east-1`.
 
 Дальше одна команда на запись:
 

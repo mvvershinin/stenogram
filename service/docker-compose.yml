@@ -1,24 +1,27 @@
-# Локальный/офлайн стенд: MinIO + API + воркер, один хост, один процесс на каждый.
+# Сервис: API и воркер. Хранилище сюда не входит: подойдёт любое S3-совместимое, адрес и
+# ключи задаются в .env (STENOGRAM_S3_*). Локальный MinIO подключается отдельным файлом
+# docker-compose.minio.yml через COMPOSE_FILE в .env; без него MinIO не запускается и его
+# образы не нужны.
 #
 # Подготовка (однократно, с сетью — образы и модели тянутся ДО того, как контур
 # закрывается, ровно как в docs/эксплуатация.md для пакета stenogram):
 #
-#   cp .env.example .env                      # заполнить пути к моделям, см. ниже
+#   cp .env.example .env                      # заполнить ключи и пути к моделям, см. ниже
 #   docker compose --profile cpu build
 #   docker compose --profile cpu up -d
 #
 # --profile cpu (или gpu) ОБЯЗАТЕЛЕН — без него ни один воркер не поднимется:
 # `worker` и `worker-cuda` взаимоисключающие (см. комментарий у `worker` ниже),
 # у обоих есть свой профиль, и по умолчанию (без --profile) ни один сервис с
-# профилем не стартует. Голый `docker compose up -d` поднимет только minio/api.
+# профилем не стартует. Вместо флага можно задать COMPOSE_PROFILES в .env.
 #
 # Модели НЕ качаются образом и не лежат в репозитории — см. service/README.md,
 # раздел «Подготовка моделей». STENOGRAM_MODELS_DIR/STENOGRAM_WHISPER_MODELS_DIR
 # в .env указывают на уже готовые каталоги (--fetch или существующий кэш).
 #
-# Сеть `internal` помечена `internal: true`: ни один контейнер здесь не достаёт до
-# интернета — это то, что делает офлайн-приёмку офлайн-приёмкой, а не просто
-# «мы не полезли в сеть, но могли бы». `worker` и `minio` сидят только в ней.
+# Сеть `storage` — обычная: внешнее S3 иначе недостижимо. docker-compose.minio.yml делает
+# её `internal: true`: с локальным хранилищем воркеру интернет не нужен, и контейнеры
+# до него не достают, это и есть офлайн-режим.
 #
 # `api` тоже трогает модели (`/healthz` → `models.check_all`), значит тоже обязан
 # быть без доступа в интернет — но ему ещё нужен рабочий `ports:` для доступа с
@@ -28,8 +31,7 @@
 # но с `enable_ip_masquerade: false` (см. ниже) — это убирает SNAT для исходящих,
 # и у контейнера не остаётся обратного маршрута наружу (`Network is unreachable`
 # при попытке, проверено), а входящий DNAT публикуемого порта на эту цепочку не
-# завязан и продолжает работать. То есть `api` без интернета ровно как `worker`,
-# просто другим сетевым механизмом — единственным, что даёт вместе и то, и другое.
+# завязан и продолжает работать.
 
 x-image: &image
   build:
@@ -44,8 +46,7 @@ x-image: &image
   # profiles задаются на уровне сервиса, не якоря — см. api/worker ниже.
 
 networks:
-  internal:
-    internal: true
+  storage: {}
   edge:
     driver_opts:
       # Отключает MASQUERADE (SNAT) для исходящих — без него у контейнера нет
@@ -55,45 +56,9 @@ networks:
       com.docker.network.bridge.enable_ip_masquerade: "false"
 
 volumes:
-  minio-data:
   jobs-data: # /data: SQLite очереди + рабочие каталоги задач — общий для api и worker
 
 services:
-  minio:
-    image: quay.io/minio/minio:RELEASE.2025-04-08T15-41-24Z
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?задайте в .env}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?задайте в .env}
-    volumes:
-      - minio-data:/data
-    networks: [internal]
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
-      interval: 5s
-      timeout: 5s
-      retries: 12
-      start_period: 10s
-
-  # Разовая настройка: бакет создаётся при первом поднятии стенда и не пересоздаётся —
-  # `--ignore-existing`. Завершается кодом 0 и выходит, `docker compose up` не виснет
-  # на нём (condition: service_completed_successfully у зависимых).
-  minio-init:
-    image: quay.io/minio/mc:RELEASE.2025-04-08T15-39-49Z
-    depends_on:
-      minio:
-        condition: service_healthy
-    networks: [internal]
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?задайте в .env}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?задайте в .env}
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set local http://minio:9000 \"$$MINIO_ROOT_USER\" \"$$MINIO_ROOT_PASSWORD\" &&
-      mc mb --ignore-existing local/stenogram
-      "
-
   api:
     <<: *image
     command: ["python", "-m", "stenogram_service.api", "--host", "0.0.0.0", "--port", "8000"]
@@ -143,11 +108,14 @@ services:
     environment: &env
       STENOGRAM_DB: /data/jobs.sqlite
       STENOGRAM_WORKDIR: /data/work
-      STENOGRAM_S3_ENDPOINT: minio:9000
-      STENOGRAM_S3_ACCESS_KEY: ${MINIO_ROOT_USER:?задайте в .env}
-      STENOGRAM_S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?задайте в .env}
-      STENOGRAM_S3_SECURE: "false"
-      STENOGRAM_CACHE_BUCKET: stenogram
+      STENOGRAM_S3_ENDPOINT: ${STENOGRAM_S3_ENDPOINT:?задайте в .env}
+      STENOGRAM_S3_ACCESS_KEY: ${STENOGRAM_S3_ACCESS_KEY:?задайте в .env}
+      STENOGRAM_S3_SECRET_KEY: ${STENOGRAM_S3_SECRET_KEY:?задайте в .env}
+      STENOGRAM_S3_SECURE: ${STENOGRAM_S3_SECURE:-true}
+      STENOGRAM_S3_REGION: ${STENOGRAM_S3_REGION:-}
+      STENOGRAM_CACHE_BUCKET: ${STENOGRAM_S3_BUCKET:-stenogram}
+      # 0 — все ядра, кроме двух. Разметка получает половину этого числа.
+      STENOGRAM_THREADS: ${STENOGRAM_THREADS:-0}
       STENOGRAM_WHISPER_MODEL: ${STENOGRAM_WHISPER_MODEL:-large-v3-turbo}
       STENOGRAM_WHISPER_DIR: /models/whisper
       STENOGRAM_HOME: /models/stenogram
@@ -160,10 +128,7 @@ services:
       - jobs-data:/data
       - ${STENOGRAM_MODELS_DIR:?задайте в .env — каталог ONNX-моделей разметки}:/models/stenogram:ro
       - ${STENOGRAM_WHISPER_MODELS_DIR:?задайте в .env — каталог модели whisper}:/models/whisper:ro
-    depends_on:
-      minio-init:
-        condition: service_completed_successfully
-    networks: [internal]
+    networks: [storage]
     restart: unless-stopped
     # SIGTERM прерывает текущую задачу на БЛИЖАЙШЕМ событии прогресса (worker.py,
     # класс Progress). Сегментация репортит прогресс каждые 10% (diarization.py,
@@ -232,10 +197,7 @@ services:
       - jobs-data:/data
       - ${STENOGRAM_MODELS_DIR:?задайте в .env — каталог ONNX-моделей разметки}:/models/stenogram:ro
       - ${STENOGRAM_WHISPER_MODELS_DIR:?задайте в .env — каталог модели whisper}:/models/whisper:ro
-    depends_on:
-      minio-init:
-        condition: service_completed_successfully
-    networks: [internal]
+    networks: [storage]
     restart: unless-stopped
     stop_grace_period: 600s
     healthcheck: *worker-healthcheck

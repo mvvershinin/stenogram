@@ -39,8 +39,8 @@ docker compose ps    # api, minio, worker healthy, minio-init завершилс
 карты нет, см. `Dockerfile`.
 
 Один образ (`Dockerfile`), три процесса — `api`, `worker`, `worker-cuda` запускают
-его разными `command:`/стадиями. `worker`/`worker-cuda` (и `minio`) — в сети
-`internal` (`internal: true`): без доступа в интернет вовсе. `api` — в отдельной
+его разными `command:`/стадиями. `worker`/`worker-cuda` — в сети
+`storage`, с локальным MinIO она `internal: true`: без доступа в интернет вовсе. `api` — в отдельной
 сети `edge`: на этом (rootless) докере `internal: true` ломает публикацию порта
 начисто (пустой `Gateway`, `ports:` не работает), поэтому `edge` — обычный bridge,
 но с отключённым исходящим NAT (`enable_ip_masquerade: false` в `docker-compose.yml`)
@@ -82,12 +82,33 @@ healthcheck) идёт по расписанию независимо от про
 уже нет. Таймаут на `subprocess.run` ffmpeg внутри пайплайна сторож не
 заменяет — это отдельная задача, здесь не трогали.
 
+## Хранилище
+
+Подходит любое S3-совместимое хранилище, MinIO не обязателен. Сервис состоит из файлов:
+
+| Файл | Что внутри | Когда нужен |
+|---|---|---|
+| `docker-compose.yml` | API и воркер | всегда |
+| `docker-compose.minio.yml` | локальный MinIO, закрывает сеть воркера от интернета | локальное хранилище |
+| `docker-compose.lan.yml` | публикует порт MinIO | заливка с другого компьютера |
+
+Набор задаётся через `COMPOSE_FILE` в `.env`. Чтобы отключить MinIO, оставьте только
+`docker-compose.yml` и укажите в `.env` адрес и ключи своего хранилища, варианты есть в
+`.env.example`. Бакет должен существовать заранее. Проверено 06.11.2026: со сборкой без
+MinIO сервис работает с хранилищем на другом адресе, контейнер MinIO не создаётся.
+
+С внешним S3 воркер получает выход в сеть, иначе ему не дойти до хранилища, поэтому режим
+без интернета есть только с локальным MinIO.
+
+Образы из `docker-compose.minio.yml` больше не скачиваются с `quay.io` и Docker Hub
+(проверено 06.11.2026). Нужна готовая копия, перенесённая через `docker save` / `docker load`.
+
 ## Стенд в локальной сети
 
 Сервис на машине с картой, запись на другом компьютере. На сервере в `.env` добавить:
 
 ```bash
-COMPOSE_FILE=docker-compose.yml:docker-compose.lan.yml
+COMPOSE_FILE=docker-compose.yml:docker-compose.minio.yml:docker-compose.lan.yml
 COMPOSE_PROFILES=gpu
 STENOGRAM_THREADS=12    # разметке достаётся половина: на 6 ядрах это все 6
 ```
@@ -95,8 +116,8 @@ STENOGRAM_THREADS=12    # разметке достаётся половина: 
 `docker compose up -d --build` выполняется один раз. Дальше контейнеры поднимает сам
 Docker при загрузке машины (`restart: unless-stopped`).
 
-На своём компьютере положить в `~/.config/stenogram/remote.env` адрес и ключи
-(`STENOGRAM_HOST`, `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD`) и запускать:
+На своём компьютере положить в `~/.config/stenogram/remote.env` адреса и ключи
+(`STENOGRAM_API`, `STENOGRAM_S3_URL`, `STENOGRAM_S3_ACCESS_KEY`, `STENOGRAM_S3_SECRET_KEY`) и запускать:
 
 ```bash
 service/transcribe.sh запись.mp3
@@ -104,11 +125,12 @@ service/transcribe.sh запись.mp3
 
 Стенограмма появляется рядом с записью: `запись.txt` и `запись.blocks.json`. Нужны `curl`
 и `jq`. Шумная запись, например из зала суда: `service/transcribe.sh запись.mp3
-'{"language": "ru", "denoise": true}'`. Без этого детектор речи теряет большую её часть. API и MinIO открыты всей локальной сети, API без авторизации.
+'{"language": "ru", "denoise": true}'`. Без этого детектор речи теряет большую её часть.
+API и MinIO открыты всей локальной сети, API без авторизации.
 
 ## Пример: POST → GET → rerun
 
-Файл сперва должен лежать в MinIO (`mc cp`, консоль на `:9001`, или SDK). Дальше:
+Файл сперва должен лежать в S3 (`service/transcribe.sh` заливает его сам, иначе `mc cp` или SDK). Дальше:
 
 ```bash
 curl -s -X POST http://localhost:8000/jobs \
@@ -131,7 +153,7 @@ curl -s -X POST http://localhost:8000/jobs/<job_id>/rerun \
 # {"job_id": "…", "rerun_of": "<родительская задача>"}
 ```
 
-`result.blocks`/`result.transcript` — адреса `s3://...` в том же MinIO; скачивать
+`result.blocks`/`result.transcript` — адреса `s3://...` в том же хранилище; скачивать
 тем же клиентом (`mc cat`, SDK), сервис файлы наружу не проксирует.
 
 ## Коды отказов (`GET /jobs/{id}` → `error.code`)

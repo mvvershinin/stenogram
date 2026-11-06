@@ -3,24 +3,27 @@
 #
 #   service/transcribe.sh запись.mp3 ['{"language": "ru", "speakers": 4}']
 #
-# Второй аргумент — параметры задачи из POST /jobs. Адрес и ключи — в
-# ~/.config/stenogram/remote.env: STENOGRAM_HOST, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD.
+# Второй аргумент — параметры задачи из POST /jobs. Настройки — в ~/.config/stenogram/remote.env:
+# STENOGRAM_API, STENOGRAM_S3_URL, STENOGRAM_S3_ACCESS_KEY, STENOGRAM_S3_SECRET_KEY и, если
+# отличаются от умолчаний, STENOGRAM_S3_BUCKET и STENOGRAM_S3_REGION.
 set -euo pipefail
 
 source "${STENOGRAM_REMOTE_ENV:-$HOME/.config/stenogram/remote.env}"
 
 file=$(realpath "$1")
 params=${2:-'{"language": "ru"}'}
-api="http://$STENOGRAM_HOST:${STENOGRAM_API_PORT:-8000}"
-s3="http://$STENOGRAM_HOST:${STENOGRAM_S3_PORT:-9000}"
+api=$STENOGRAM_API
+s3=$STENOGRAM_S3_URL
+bucket=${STENOGRAM_S3_BUCKET:-stenogram}
+region=${STENOGRAM_S3_REGION:-us-east-1}
 
 s3curl() {
-    curl -fsS --aws-sigv4 aws:amz:us-east-1:s3 --user "$MINIO_ROOT_USER:$MINIO_ROOT_PASSWORD" \
+    curl -fsS --aws-sigv4 "aws:amz:$region:s3" --user "$STENOGRAM_S3_ACCESS_KEY:$STENOGRAM_S3_SECRET_KEY" \
         -H 'x-amz-content-sha256: UNSIGNED-PAYLOAD' "$@"
 }
 
 if ! curl -fsS -m 30 -o /dev/null "$api/healthz"; then
-    echo "Сервис на $STENOGRAM_HOST не отвечает: машина выключена или загружена в Windows" >&2
+    echo "Сервис $api не отвечает: машина выключена или сервис не запущен" >&2
     exit 1
 fi
 
@@ -28,9 +31,9 @@ fi
 # заливка того же файла ничего не меняет.
 key="uploads/$(sha256sum "$file" | cut -d' ' -f1).${file##*.}"
 echo "Заливаю $(basename "$file") ..."
-s3curl -T "$file" "$s3/stenogram/$key"
+s3curl -T "$file" "$s3/$bucket/$key"
 
-job=$(jq -n --arg source "s3://stenogram/$key" --argjson params "$params" '$params + {source: $source}' |
+job=$(jq -n --arg source "s3://$bucket/$key" --argjson params "$params" '$params + {source: $source}' |
     curl -fsS -H 'content-type: application/json' -d @- "$api/jobs" | jq -r .job_id)
 echo "Задача $job"
 
